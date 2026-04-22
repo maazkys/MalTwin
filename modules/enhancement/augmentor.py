@@ -1,44 +1,92 @@
+# modules/enhancement/augmentor.py
+import random
 import torch
-import torchvision.transforms as T
+import numpy as np
+from torchvision import transforms
+from PIL import Image
 
 
 class GaussianNoise:
     """
-    Custom torchvision-compatible transform.
-    Operates on torch.Tensor post ToTensor().
-    Adds Gaussian noise with mean=0, std sampled uniformly from [0.01, 0.05].
-    Clamps output to [0.0, 1.0].
-    SRS ref: FE-2 of Module 4
+    Custom torchvision-compatible transform that adds Gaussian noise to a tensor.
+
+    MUST be placed AFTER transforms.ToTensor() in the pipeline.
+    Operates on torch.Tensor, not PIL.Image.
+
+    Constructor args:
+        mean (float):      noise mean, default 0.0
+        std_range (tuple): (min_std, max_std), std sampled uniformly each call.
+                           Default (0.01, 0.05).
+
+    __call__:
+        1. Sample std = random.uniform(std_range[0], std_range[1])
+        2. Generate noise = torch.randn_like(tensor) * std + mean
+        3. result = tensor + noise
+        4. Clamp result to [0.0, 1.0]
+        5. Return clamped tensor (same shape and dtype as input)
     """
+
+    def __init__(self, mean: float = 0.0, std_range: tuple = (0.01, 0.05)):
+        self.mean = mean
+        self.std_range = std_range
 
     def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
-        std = torch.empty(1).uniform_(0.01, 0.05).item()
-        noise = torch.randn_like(tensor) * std
+        std = random.uniform(self.std_range[0], self.std_range[1])
+        noise = torch.randn_like(tensor) * std + self.mean
         return torch.clamp(tensor + noise, 0.0, 1.0)
 
+    def __repr__(self) -> str:
+        return f"GaussianNoise(mean={self.mean}, std_range={self.std_range})"
 
-def get_train_transforms(img_size: int) -> T.Compose:
+
+def get_train_transforms(img_size: int = 128) -> transforms.Compose:
     """
-    Returns a Compose pipeline for TRAINING data only.
-    NOTE: Our dataset returns tensors already (shape 1,H,W), so we skip ToTensor()
-    and apply transforms directly on tensors.
-    SRS ref: FE-1 of Module 4
+    Build the augmentation pipeline for training data.
+
+    Transform order (CRITICAL — do not reorder):
+        1. RandomRotation(degrees=15, fill=0)      ← PIL stage
+        2. RandomHorizontalFlip(p=0.5)             ← PIL stage
+        3. RandomVerticalFlip(p=0.5)               ← PIL stage
+        4. ColorJitter(brightness=0.2)             ← PIL stage (MUST be before ToTensor)
+        5. ToTensor()                              ← converts PIL 'L' → (1, H, W) float32
+        6. GaussianNoise(mean=0.0, std=(0.01,0.05))← Tensor stage (MUST be after ToTensor)
+        7. Normalize(mean=[0.5], std=[0.5])        ← Tensor stage (single-element lists!)
+
+    Args:
+        img_size: not used directly (resizing done in Dataset.__getitem__).
+
+    Returns:
+        transforms.Compose instance
     """
-    return T.Compose([
-        T.RandomRotation(degrees=15),
-        T.RandomHorizontalFlip(p=0.5),
-        T.RandomVerticalFlip(p=0.5),
-        T.ColorJitter(brightness=0.2),
-        GaussianNoise(),
-        T.Normalize(mean=[0.5], std=[0.5]),
+    return transforms.Compose([
+        transforms.RandomRotation(degrees=15, fill=0),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
+        transforms.ColorJitter(brightness=0.2),    # PIL stage — before ToTensor
+        transforms.ToTensor(),
+        GaussianNoise(mean=0.0, std_range=(0.01, 0.05)),  # Tensor stage — after ToTensor
+        transforms.Normalize(mean=[0.5], std=[0.5]),       # single-element lists
     ])
 
 
-def get_val_transforms(img_size: int) -> T.Compose:
+def get_val_transforms(img_size: int = 128) -> transforms.Compose:
     """
-    Returns Compose for val/test — NO augmentation, only normalize.
-    SRS ref: FE-1 of Module 4
+    Build the inference/validation transform pipeline (NO augmentation).
+
+    Transform order:
+        1. ToTensor()                       ← PIL 'L' → (1, H, W) float32
+        2. Normalize(mean=[0.5], std=[0.5]) ← maps [0,1] to [-1,1]
+
+    Used for val, test, and inference. NEVER use get_train_transforms for inference.
+
+    Args:
+        img_size: kept for API consistency, not used here.
+
+    Returns:
+        transforms.Compose instance
     """
-    return T.Compose([
-        T.Normalize(mean=[0.5], std=[0.5]),
+    return transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5], std=[0.5]),
     ])
+

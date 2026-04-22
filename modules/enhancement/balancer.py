@@ -1,50 +1,71 @@
+# modules/enhancement/balancer.py
+import math
 import torch
 from torch.utils.data import WeightedRandomSampler
+from collections import Counter
 
 
 class ClassAwareOversampler:
     """
-    Wraps torch.utils.data.WeightedRandomSampler.
-    SRS ref: FE-3 of Module 4
+    Produces a WeightedRandomSampler to address class imbalance in Malimg.
+
+    Malimg is severely imbalanced (Allaple.A has ~2949 samples, Skintrim.N has ~80).
+    Without balancing, the CNN learns to predict majority classes and performs
+    poorly on rare families.
+
+    Constructor args:
+        dataset:  a MalimgDataset instance (train split).
+                  Must expose a get_labels() method returning list[int].
+        strategy: one of 'oversample_minority', 'sqrt_inverse', 'uniform'.
+
+    Strategies:
+        'oversample_minority' — weight = 1 / class_count (pure inverse frequency)
+        'sqrt_inverse'        — weight = 1 / sqrt(class_count) (softer balancing)
+        'uniform'             — weight = 1.0 for all samples (effectively random sampling)
+
+    Properties set after get_sampler() call:
+        self.class_weights: dict[int, float]
+        self.effective_class_counts: dict[int, float]
     """
 
-    def __init__(self, dataset, strategy: str = "oversample_minority"):
+    def __init__(self, dataset, strategy: str = 'oversample_minority'):
         self.dataset = dataset
         self.strategy = strategy
+        self.class_weights: dict[int, float] = {}
+        self.effective_class_counts: dict[int, float] = {}
 
     def get_sampler(self) -> WeightedRandomSampler:
         """
-        Returns sampler that draws len(dataset) samples per epoch with replacement.
+        Compute per-sample weights and return a WeightedRandomSampler.
         """
-        class_counts = self.dataset.class_counts
-        class_names = self.dataset.class_names
-        label_map = {name: idx for idx, name in enumerate(class_names)}
+        labels = self.dataset.get_labels()
+        class_counts = Counter(labels)
 
-        # Build per-class weights
-        class_weights: dict[int, float] = {}
-        for name, count in class_counts.items():
-            idx = label_map[name]
-            if count == 0:
-                class_weights[idx] = 0.0
-            elif self.strategy == "oversample_minority":
-                class_weights[idx] = 1.0 / count
-            elif self.strategy == "sqrt_inverse":
-                import math
-                class_weights[idx] = 1.0 / math.sqrt(count)
-            elif self.strategy == "uniform":
-                class_weights[idx] = 1.0
-            else:
-                raise ValueError(f"Unknown strategy: {self.strategy}")
+        if self.strategy == 'oversample_minority':
+            self.class_weights = {c: 1.0 / count for c, count in class_counts.items()}
+        elif self.strategy == 'sqrt_inverse':
+            self.class_weights = {c: 1.0 / math.sqrt(count) for c, count in class_counts.items()}
+        elif self.strategy == 'uniform':
+            self.class_weights = {c: 1.0 for c in class_counts}
+        else:
+            raise ValueError(f"Unknown strategy: {self.strategy}. "
+                             "Choose from: oversample_minority, sqrt_inverse, uniform")
 
-        # Build per-sample weights list
-        sample_weights = []
-        for _, label in self.dataset._samples:
-            sample_weights.append(class_weights.get(label, 0.0))
+        total_weight = sum(self.class_weights.values())
+        n = len(labels)
+        self.effective_class_counts = {
+            c: self.class_weights[c] / total_weight * n
+            for c in self.class_weights
+        }
 
-        weights_tensor = torch.tensor(sample_weights, dtype=torch.float)
-        sampler = WeightedRandomSampler(
-            weights=weights_tensor,
-            num_samples=len(self.dataset),
+        sample_weights = torch.tensor(
+            [self.class_weights[label] for label in labels],
+            dtype=torch.float32,
+        )
+
+        return WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(labels),
             replacement=True,
         )
-        return sampler
+
