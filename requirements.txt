@@ -1,11 +1,11 @@
 # Deep Learning
-torch==2.3.1
-torchvision==0.18.1
+torch==2.6.0
+torchvision==0.21.0
 captum==0.7.0
 
 # Image Processing
 opencv-python-headless==4.10.0.84
-Pillow==10.4.0
+Pillow==12.2.0
 numpy==1.26.4
 
 # Data / ML utilities
