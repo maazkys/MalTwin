@@ -171,7 +171,7 @@ def main():
     # ── 7. Save eval metrics JSON ──────────────────────────────────────────────
     print("\n[6/6] Saving outputs...")
     try:
-        metrics_path = config.PROCESSED_DIR / 'eval_metrics.json'
+        metrics_path = config.EVAL_METRICS_PATH
         # confusion_matrix is np.ndarray — not JSON serialisable; exclude it
         # classification_report is a string — exclude (too verbose for dashboard)
         serialisable = {
@@ -191,7 +191,7 @@ def main():
 
     # ── 8. Save confusion matrix PNG ───────────────────────────────────────────
     try:
-        cm_path = config.PROCESSED_DIR / 'confusion_matrix.png'
+        cm_path = config.CONFUSION_MATRIX_PATH
         plot_confusion_matrix(metrics['confusion_matrix'], class_names, cm_path)
         print(f"  Confusion matrix → {cm_path}")
     except Exception as e:

@@ -147,7 +147,7 @@ def main():
     # ── 8. Optionally save metrics ────────────────────────────────────────────
     if args.save_metrics:
         try:
-            metrics_path = config.PROCESSED_DIR / 'eval_metrics.json'
+            metrics_path = config.EVAL_METRICS_PATH
             serialisable = {
                 k: v for k, v in metrics.items()
                 if k not in ('confusion_matrix', 'per_class', 'classification_report')

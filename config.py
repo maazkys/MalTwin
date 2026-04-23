@@ -23,7 +23,9 @@ REPORTS_DIR     = Path(os.getenv("MALTWIN_REPORTS_DIR",     str(BASE_DIR / "repo
 MITRE_JSON_PATH  = BASE_DIR / "data" / "mitre_ics_mapping.json"
 CLASS_NAMES_PATH = PROCESSED_DIR / "class_names.json"
 DB_PATH          = LOG_DIR / "maltwin.db"
-BEST_MODEL_PATH  = MODEL_DIR / "best_model.pt"
+BEST_MODEL_PATH       = MODEL_DIR / "best_model.pt"
+EVAL_METRICS_PATH     = PROCESSED_DIR / "eval_metrics.json"
+CONFUSION_MATRIX_PATH = PROCESSED_DIR / "confusion_matrix.png"
 
 # Create directories at import time (safe to call repeatedly)
 for _dir in [PROCESSED_DIR, MODEL_DIR, CHECKPOINT_DIR, LOG_DIR, REPORTS_DIR]:
