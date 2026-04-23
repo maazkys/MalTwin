@@ -1,498 +1,162 @@
-# MalTwin — Phase 2: Dataset Module
-### Agent Instruction Document | `modules/dataset/` + `tests/test_dataset.py`
-
-> **Read this entire document before writing a single line of code.**
-> Every class, method, signature, and behavioral rule is specified completely.
-> Do not infer, guess, or deviate from what is written here.
+# MalTwin — Phase 3 Implementation
+### Data Enhancement & Balancing Module
+### Agent Instruction Document
 
 ---
 
-## Mandatory Rules (from PRD Section 16)
+## YOUR TASK
 
-These are the most commonly hallucinated bugs. Violating any of them causes test failures.
+Implement Phase 3 of the MalTwin project: the data augmentation and class balancing pipeline.
 
-- **Read `MALTWIN_PRD_COMPLETE.md`** before writing any code.
-- All CNN tensors are **single-channel** `(batch, 1, H, W)` — NEVER RGB `(batch, 3, H, W)`.
-- `cv2.imread()` is **always** called with `cv2.IMREAD_GRAYSCALE` flag. Never load as BGR.
-- `cv2.resize()` target is `(width, height)` — i.e. `(IMG_SIZE, IMG_SIZE)`. OpenCV uses `(width, height)` convention. **This is the most common bug.**
-- `transforms.Normalize(mean=[0.5], std=[0.5])` uses **single-element lists** (not scalars, not 3-element lists).
-- `encode_labels()` **always sorts alphabetically** — same input always produces the same mapping.
-- All `train_test_split()` calls use `random_state=config.RANDOM_SEED` (42).
-- `get_val_transforms` is used for **val, test, and inference** — never `get_train_transforms` for inference.
-- `drop_last=True` on train DataLoader to prevent single-sample batches breaking BatchNorm.
-- All paths use `pathlib.Path`, never string concatenation.
-- Tests requiring Malimg dataset are marked `@pytest.mark.integration`.
-- `pytest tests/test_dataset.py -v -m "not integration"` must pass with **zero failures** without any dataset present.
+This phase builds on top of Phase 1 (binary_to_image) and Phase 2 (dataset).
+It has no new external dependencies beyond what is already in `requirements.txt`.
+
+At the end of this phase the following must be true:
+- `pytest tests/test_enhancement.py -v` passes with **zero failures**
+- `get_train_transforms` and `get_val_transforms` produce correctly shaped tensors
+- `ClassAwareOversampler` produces a valid `WeightedRandomSampler`
+- All augmentation transforms apply in the correct order (PIL stage before tensor stage)
 
 ---
 
-## Phase 2 Scope
+## CONTEXT: WHERE THIS FITS
 
-Phase 2 implements the dataset loading, preprocessing, and (partially) the enhancement module that the loader depends on. It does **not** implement the full enhancement module (that is Phase 3) — but the loader imports `get_train_transforms` and `get_val_transforms` from `modules/enhancement/augmentor.py`, so a minimal version of those two functions must exist.
-
-### Files to create
-
-| File | Description |
-|------|-------------|
-| `modules/dataset/__init__.py` | Package exports |
-| `modules/dataset/preprocessor.py` | `validate_dataset_integrity`, `normalize_image`, `encode_labels`, `save_class_names`, `load_class_names` |
-| `modules/dataset/loader.py` | `MalimgDataset`, `get_dataloaders` |
-| `modules/enhancement/__init__.py` | Package exports (minimal) |
-| `modules/enhancement/augmentor.py` | `GaussianNoise`, `get_train_transforms`, `get_val_transforms` |
-| `modules/enhancement/balancer.py` | `ClassAwareOversampler` |
-| `tests/test_dataset.py` | Full test suite (exactly as specified below) |
-
-> **Note:** Phase 2 produces the full `modules/enhancement/` module because `loader.py` imports from it. The enhancement tests (`tests/test_enhancement.py`) are left for Phase 3 — but the implementation must be complete and correct here.
-
----
-
-## File 1: `modules/dataset/__init__.py`
-
-```python
-# modules/dataset/__init__.py
-from .loader import MalimgDataset, get_dataloaders
-from .preprocessor import validate_dataset_integrity
+```
+Phase 1 — binary_to_image/   ✅ DONE
+Phase 2 — dataset/            ✅ DONE
+Phase 3 — enhancement/        ← YOU ARE HERE
+Phase 4 — detection/          (next)
+Phase 5 — scripts/train.py    (after phase 4)
+Phase 6 — dashboard/          (after phase 5)
 ```
 
----
-
-## File 2: `modules/dataset/preprocessor.py`
+Phase 3 outputs are consumed by Phase 2's `get_dataloaders()` function.
+Specifically, `modules/dataset/loader.py` imports:
 
 ```python
-# modules/dataset/preprocessor.py
-import cv2
-import json
-import numpy as np
-from pathlib import Path
-from typing import Optional
-
-
-def validate_dataset_integrity(data_dir: Path) -> dict:
-    """
-    Scans the Malimg dataset directory and produces an integrity report.
-
-    Args:
-        data_dir: Path to the Malimg root directory (config.DATA_DIR).
-
-    Returns:
-        {
-            'valid':            bool,         # True if no corrupt files found
-            'families':         list[str],    # sorted list of family folder names
-            'counts':           dict[str,int],# {family: sample_count}
-            'total':            int,          # sum of all counts
-            'min_class':        str,          # family with fewest samples
-            'max_class':        str,          # family with most samples
-            'imbalance_ratio':  float,        # max_count / min_count
-            'corrupt_files':    list[str],    # str(path) of unreadable files
-            'missing_dirs':     list[str],    # always [] — see notes
-        }
-
-    Raises:
-        FileNotFoundError: if data_dir does not exist
-        FileNotFoundError: if data_dir has no subdirectories
-
-    Implementation notes:
-        - Iterate over data_dir.iterdir(), keeping only directories.
-        - For each family dir, iterate over *.png files (case-insensitive via glob('*.png') + glob('*.PNG')).
-        - For each PNG, attempt cv2.imread(str(path), cv2.IMREAD_GRAYSCALE).
-          If result is None, add str(path) to corrupt_files list.
-        - Sort families alphabetically.
-        - corrupt_files contains str representations of Path objects.
-        - missing_dirs = [] (we cannot know expected names without hardcoding).
-        - imbalance_ratio = max_count / min_count. Handle divide-by-zero if min_count == 0.
-    """
-    if not data_dir.exists():
-        raise FileNotFoundError(f"Dataset directory not found: {data_dir}")
-
-    subdirs = [p for p in data_dir.iterdir() if p.is_dir()]
-    if not subdirs:
-        raise FileNotFoundError(f"Dataset directory is empty: {data_dir}")
-
-    families = sorted([d.name for d in subdirs])
-    counts = {}
-    corrupt_files = []
-
-    for family_dir in sorted(subdirs, key=lambda d: d.name):
-        family = family_dir.name
-        png_files = list(family_dir.glob('*.png')) + list(family_dir.glob('*.PNG'))
-        # Deduplicate (glob may overlap on case-insensitive filesystems)
-        png_files = list({str(p): p for p in png_files}.values())
-        count = 0
-        for path in png_files:
-            img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-            if img is None:
-                corrupt_files.append(str(path))
-            else:
-                count += 1
-        counts[family] = count
-
-    total = sum(counts.values())
-    max_class = max(counts, key=lambda k: counts[k]) if counts else ''
-    min_class = min(counts, key=lambda k: counts[k]) if counts else ''
-    max_count = counts.get(max_class, 0)
-    min_count = counts.get(min_class, 1)
-    imbalance_ratio = max_count / min_count if min_count > 0 else float('inf')
-
-    return {
-        'valid':           len(corrupt_files) == 0,
-        'families':        families,
-        'counts':          counts,
-        'total':           total,
-        'min_class':       min_class,
-        'max_class':       max_class,
-        'imbalance_ratio': imbalance_ratio,
-        'corrupt_files':   corrupt_files,
-        'missing_dirs':    [],
-    }
-
-
-def normalize_image(img: np.ndarray) -> np.ndarray:
-    """
-    Convert uint8 image [0, 255] to float32 [0.0, 1.0].
-
-    Args:
-        img: numpy array, dtype uint8.
-
-    Returns:
-        numpy array, same shape, dtype float32, values in [0.0, 1.0].
-
-    Implementation:
-        return img.astype(np.float32) / 255.0
-
-    Notes:
-        - Do NOT use cv2.normalize here. Simple division is exact and fast.
-        - The output of this function feeds directly into PyTorch tensors.
-    """
-    return img.astype(np.float32) / 255.0
-
-
-def encode_labels(families: list[str]) -> dict[str, int]:
-    """
-    Create a deterministic string→integer label mapping.
-
-    Args:
-        families: list of family names.
-
-    Returns:
-        Dict mapping each family name to a unique integer [0, len(families)-1].
-        Sorted alphabetically so the mapping is always the same for the same input.
-
-    Implementation:
-        return {name: idx for idx, name in enumerate(sorted(families))}
-
-    Example:
-        encode_labels(['Yuner.A', 'Allaple.A', 'VB.AT'])
-        → {'Allaple.A': 0, 'VB.AT': 1, 'Yuner.A': 2}
-    """
-    return {name: idx for idx, name in enumerate(sorted(families))}
-
-
-def save_class_names(class_names: list[str], output_path: Path) -> None:
-    """
-    Persist the ordered class name list to JSON for dashboard use.
-
-    Args:
-        class_names: sorted list of family names (index = label integer).
-        output_path: destination JSON path (config.CLASS_NAMES_PATH).
-
-    File format:
-        {"class_names": ["Adialer.C", "Agent.FYI", ...]}
-
-    Notes:
-        - Creates parent directory if it does not exist.
-        - Overwrites if file already exists.
-    """
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, 'w') as f:
-        json.dump({'class_names': class_names}, f, indent=2)
-
-
-def load_class_names(input_path: Path) -> list[str]:
-    """
-    Load class names from JSON file written by save_class_names.
-
-    Args:
-        input_path: path to class_names.json (config.CLASS_NAMES_PATH).
-
-    Returns:
-        list[str] of family names in index order.
-
-    Raises:
-        FileNotFoundError: if file does not exist.
-    """
-    if not input_path.exists():
-        raise FileNotFoundError(
-            f"class_names.json not found at {input_path}. "
-            "Run scripts/train.py first."
-        )
-    with open(input_path) as f:
-        return json.load(f)['class_names']
+from modules.enhancement.augmentor import get_train_transforms, get_val_transforms
+from modules.enhancement.balancer import ClassAwareOversampler
 ```
 
+These imports already exist in the Phase 2 code. If they are currently commented
+out or raising ImportError, this phase fixes that.
+
 ---
 
-## File 3: `modules/dataset/loader.py`
+## FILES TO CREATE
 
-```python
-# modules/dataset/loader.py
-import cv2
-import json
-import torch
-import numpy as np
-from pathlib import Path
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from sklearn.model_selection import train_test_split
-from torchvision import transforms
-from typing import Optional, Callable
-from PIL import Image
-
-import config
-from .preprocessor import encode_labels, save_class_names
-
-
-class MalimgDataset(Dataset):
-    """
-    PyTorch Dataset for the Malimg malware image dataset.
-
-    Loads grayscale PNG images from directory structure:
-        data_dir/FamilyName/image.png
-
-    Each image is:
-        1. Loaded as grayscale (single channel) with cv2.IMREAD_GRAYSCALE
-        2. Resized to (img_size, img_size) using cv2.resize(img, (img_size, img_size))
-           NOTE: cv2.resize takes (width, height), so (img_size, img_size) is correct for square images.
-        3. Converted to PIL Image mode 'L'
-        4. Transform applied (returns float32 tensor shape (1, H, W))
-
-    Internal data structure:
-        self.samples: list[tuple[Path, int]]
-        self.class_names: list[str]  — sorted alphabetically, index = label integer
-        self.label_map: dict[str, int]
-        self.class_counts: dict[str, int]  — counts for THIS split only
-
-    Split algorithm (must be implemented exactly as specified):
-        Step 1: Gather all (path, label) pairs for entire dataset across all families.
-        Step 2: Extract label list for stratification.
-        Step 3: train_test_split(all_samples, test_size=(val_ratio + test_ratio),
-                                 stratify=labels, random_state=random_seed)
-                → produces train_samples, temp_samples
-        Step 4: relative_val = val_ratio / (val_ratio + test_ratio)
-                train_test_split(temp_samples, test_size=(1 - relative_val),
-                                 stratify=temp_labels, random_state=random_seed)
-                → produces val_samples, test_samples
-        Step 5: self.samples = train_samples / val_samples / test_samples per requested split.
-    """
-
-    def __init__(
-        self,
-        data_dir: Path,
-        split: str,
-        img_size: int = config.IMG_SIZE,
-        transform: Optional[Callable] = None,
-        train_ratio: float = config.TRAIN_RATIO,
-        val_ratio: float = config.VAL_RATIO,
-        test_ratio: float = config.TEST_RATIO,
-        random_seed: int = config.RANDOM_SEED,
-    ):
-        if not data_dir.exists():
-            raise FileNotFoundError(f"Dataset directory not found: {data_dir}")
-        if split not in ('train', 'val', 'test'):
-            raise ValueError(f"split must be 'train', 'val', or 'test', got '{split}'")
-        if abs(train_ratio + val_ratio + test_ratio - 1.0) > 1e-6:
-            raise ValueError("train_ratio + val_ratio + test_ratio must sum to 1.0")
-
-        self.data_dir = data_dir
-        self.split = split
-        self.img_size = img_size
-        self.random_seed = random_seed
-
-        # Build label map from all family subdirectories
-        family_dirs = sorted([p for p in data_dir.iterdir() if p.is_dir()], key=lambda p: p.name)
-        all_families = [d.name for d in family_dirs]
-        self.label_map = encode_labels(all_families)
-        self.class_names = sorted(all_families)  # sorted alphabetically
-
-        # Gather all (path, label) pairs
-        all_samples: list[tuple[Path, int]] = []
-        for family_dir in family_dirs:
-            label = self.label_map[family_dir.name]
-            png_files = sorted(list(family_dir.glob('*.png')) + list(family_dir.glob('*.PNG')))
-            # Deduplicate on case-insensitive filesystems
-            seen = set()
-            deduped = []
-            for p in png_files:
-                key = str(p).lower()
-                if key not in seen:
-                    seen.add(key)
-                    deduped.append(p)
-            for path in deduped:
-                all_samples.append((path, label))
-
-        # Stratified split
-        labels = [s[1] for s in all_samples]
-        train_samples, temp_samples = train_test_split(
-            all_samples,
-            test_size=(val_ratio + test_ratio),
-            stratify=labels,
-            random_state=random_seed,
-        )
-        temp_labels = [s[1] for s in temp_samples]
-        relative_val = val_ratio / (val_ratio + test_ratio)
-        val_samples, test_samples = train_test_split(
-            temp_samples,
-            test_size=(1.0 - relative_val),
-            stratify=temp_labels,
-            random_state=random_seed,
-        )
-
-        split_map = {'train': train_samples, 'val': val_samples, 'test': test_samples}
-        self.samples = split_map[split]
-
-        # Compute class counts for this split
-        from collections import Counter
-        cnt = Counter(lbl for _, lbl in self.samples)
-        self.class_counts = {self.class_names[lbl]: cnt.get(lbl, 0) for lbl in range(len(self.class_names))}
-
-        # Default transform: val transforms (no augmentation)
-        if transform is None:
-            from modules.enhancement.augmentor import get_val_transforms
-            self.transform = get_val_transforms(img_size)
-        else:
-            self.transform = transform
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
-        path, label = self.samples[idx]
-        img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            raise RuntimeError(f"Failed to load image: {path}")
-        # cv2.resize takes (width, height) — for square images this is (img_size, img_size)
-        img = cv2.resize(img, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
-        pil_img = Image.fromarray(img, mode='L')
-        tensor = self.transform(pil_img)   # shape: (1, img_size, img_size), float32
-        return tensor, label
-
-    def get_labels(self) -> list[int]:
-        """Returns list of integer labels for all samples in this split."""
-        return [label for _, label in self.samples]
-
-
-def get_dataloaders(
-    data_dir: Path = config.DATA_DIR,
-    img_size: int = config.IMG_SIZE,
-    batch_size: int = config.BATCH_SIZE,
-    num_workers: int = config.NUM_WORKERS,
-    oversample_strategy: str = config.OVERSAMPLE_STRATEGY,
-    augment_train: bool = True,
-    random_seed: int = config.RANDOM_SEED,
-) -> tuple[DataLoader, DataLoader, DataLoader, list[str]]:
-    """
-    Build all three DataLoaders and return (train_loader, val_loader, test_loader, class_names).
-
-    - Train loader uses oversampling sampler + optional augmentation.
-    - Val and test loaders use val transforms, shuffle=False, no sampler.
-    - Persists class_names to config.CLASS_NAMES_PATH for dashboard use.
-    - drop_last=True on train loader prevents incomplete final batches.
-    - pin_memory=True when CUDA is available.
-    """
-    from modules.enhancement.augmentor import get_train_transforms, get_val_transforms
-    from modules.enhancement.balancer import ClassAwareOversampler
-
-    val_transform = get_val_transforms(img_size)
-    train_transform = get_train_transforms(img_size) if augment_train else val_transform
-
-    train_ds = MalimgDataset(data_dir, 'train', img_size, train_transform,
-                              random_seed=random_seed)
-    val_ds   = MalimgDataset(data_dir, 'val',   img_size, val_transform,
-                              random_seed=random_seed)
-    test_ds  = MalimgDataset(data_dir, 'test',  img_size, val_transform,
-                              random_seed=random_seed)
-
-    sampler = ClassAwareOversampler(train_ds, strategy=oversample_strategy).get_sampler()
-    use_pin = (config.DEVICE.type == 'cuda')
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        sampler=sampler,         # replaces shuffle=True
-        num_workers=num_workers,
-        pin_memory=use_pin,
-        drop_last=True,          # avoid incomplete final batch during training
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=use_pin,
-    )
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=use_pin,
-    )
-
-    # Persist class names for dashboard
-    save_class_names(train_ds.class_names, config.CLASS_NAMES_PATH)
-
-    return train_loader, val_loader, test_loader, train_ds.class_names
+```
+modules/enhancement/__init__.py
+modules/enhancement/augmentor.py
+modules/enhancement/balancer.py
+tests/test_enhancement.py
 ```
 
----
-
-## File 4: `modules/enhancement/__init__.py`
-
-```python
-# modules/enhancement/__init__.py
-from .augmentor import get_train_transforms, get_val_transforms, GaussianNoise
-from .balancer import ClassAwareOversampler
-```
+Do not modify any existing files unless fixing a broken import in
+`modules/dataset/loader.py` that references these modules.
 
 ---
 
-## File 5: `modules/enhancement/augmentor.py`
+## MANDATORY RULES — READ BEFORE WRITING ANY CODE
+
+1. **Transform ordering is critical and non-negotiable:**
+   - `RandomRotation`, `RandomHorizontalFlip`, `RandomVerticalFlip`, `ColorJitter`
+     operate on **PIL Images** and MUST come BEFORE `transforms.ToTensor()`.
+   - `GaussianNoise` operates on **torch.Tensor** and MUST come AFTER `transforms.ToTensor()`.
+   - `transforms.Normalize` MUST be the last transform in both pipelines.
+   - Getting this order wrong silently produces wrong results — the tests verify it.
+
+2. **Single-channel normalisation only.**
+   `transforms.Normalize(mean=[0.5], std=[0.5])` uses single-element lists.
+   Never use 3-element lists. Never use scalar values. Always `[0.5]` not `0.5`.
+
+3. **`GaussianNoise` clamps output to `[0.0, 1.0]`** after adding noise.
+   This is mandatory. Unclamped noise produces values outside the normalisation
+   assumption and breaks the model.
+
+4. **`WeightedRandomSampler` uses `replacement=True`.**
+   Without this, oversampling minority classes is impossible.
+
+5. **All random ops in transforms use PyTorch/torchvision internals.**
+   Do not use `random.random()` or `np.random` inside `GaussianNoise.__call__`.
+   Use `torch.randn_like()` for noise generation.
+   Use `torch.empty(1).uniform_(low, high).item()` for sampling std.
+
+6. **`get_val_transforms` is ALWAYS deterministic.**
+   It must contain ONLY `ToTensor` and `Normalize`. No randomness whatsoever.
+   Tests verify this explicitly.
+
+7. **Both transform pipelines accept a PIL Image in mode `'L'` as input.**
+   The dataset loader calls `transform(pil_img)` where `pil_img` is a grayscale
+   PIL Image. The first transform in each pipeline must be compatible with
+   PIL Image input.
+
+8. **`ClassAwareOversampler.get_sampler()` must set `self.class_weights`**
+   as an instance attribute so tests can inspect computed weights.
+
+---
+
+## FILE 1: `modules/enhancement/augmentor.py`
 
 ```python
-# modules/enhancement/augmentor.py
-import random
+"""
+Augmentation transform pipelines for MalTwin.
+
+Training pipeline:  RandomRotation → RandomHFlip → RandomVFlip → ColorJitter
+                    → ToTensor → GaussianNoise → Normalize
+Validation pipeline: ToTensor → Normalize
+
+Both pipelines accept PIL Image mode 'L' (grayscale) as input.
+Both pipelines output torch.Tensor of shape (1, H, W), dtype float32, range [-1, 1].
+
+SRS refs: Module 4 FE-1, FE-2
+"""
 import torch
 import numpy as np
 from torchvision import transforms
-from PIL import Image
 
 
 class GaussianNoise:
     """
-    Custom torchvision-compatible transform that adds Gaussian noise to a tensor.
+    Custom torchvision-compatible transform that injects Gaussian noise into a tensor.
 
     MUST be placed AFTER transforms.ToTensor() in the pipeline.
-    Operates on torch.Tensor, not PIL.Image.
+    Operates on torch.Tensor, NOT PIL Image.
 
     Constructor args:
-        mean (float):      noise mean, default 0.0
-        std_range (tuple): (min_std, max_std), std sampled uniformly each call.
-                           Default (0.01, 0.05).
+        mean (float):      noise mean. Default 0.0.
+        std_range (tuple): (min_std, max_std). std is sampled uniformly in this
+                           range on every __call__. Default (0.01, 0.05).
 
-    __call__:
-        1. Sample std = random.uniform(std_range[0], std_range[1])
-        2. Generate noise = torch.randn_like(tensor) * std + mean
-        3. result = tensor + noise
-        4. Clamp result to [0.0, 1.0]
-        5. Return clamped tensor (same shape and dtype as input)
+    __call__(tensor: torch.Tensor) -> torch.Tensor:
+        Steps (implement in this exact order):
+            1. Sample std from uniform distribution over std_range:
+                   std = torch.empty(1).uniform_(std_range[0], std_range[1]).item()
+            2. Generate noise tensor with same shape and device as input:
+                   noise = torch.randn_like(tensor) * std + mean
+            3. Add noise to input:
+                   noisy = tensor + noise
+            4. Clamp to valid range:
+                   result = torch.clamp(noisy, 0.0, 1.0)
+            5. Return result (same shape and dtype as input tensor)
+
+    __repr__:
+        return f"GaussianNoise(mean={self.mean}, std_range={self.std_range})"
+
+    Notes:
+        - torch.randn_like preserves device and dtype of input tensor.
+        - torch.clamp is mandatory. Tests verify output is strictly in [0.0, 1.0].
+        - Do NOT use random.uniform or np.random here.
+        - This simulates minor binary perturbations (SRS Module 4 FE-2).
     """
 
-    def __init__(self, mean: float = 0.0, std_range: tuple = (0.01, 0.05)):
+    def __init__(self, mean: float = 0.0, std_range: tuple = (0.01, 0.05)) -> None:
         self.mean = mean
         self.std_range = std_range
 
     def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
-        std = random.uniform(self.std_range[0], self.std_range[1])
-        noise = torch.randn_like(tensor) * std + self.mean
-        return torch.clamp(tensor + noise, 0.0, 1.0)
+        # implement here
+        ...
 
     def __repr__(self) -> str:
         return f"GaussianNoise(mean={self.mean}, std_range={self.std_range})"
@@ -500,49 +164,92 @@ class GaussianNoise:
 
 def get_train_transforms(img_size: int = 128) -> transforms.Compose:
     """
-    Build the augmentation pipeline for training data.
-
-    Transform order (CRITICAL — do not reorder):
-        1. RandomRotation(degrees=15, fill=0)      ← PIL stage
-        2. RandomHorizontalFlip(p=0.5)             ← PIL stage
-        3. RandomVerticalFlip(p=0.5)               ← PIL stage
-        4. ColorJitter(brightness=0.2)             ← PIL stage (MUST be before ToTensor)
-        5. ToTensor()                              ← converts PIL 'L' → (1, H, W) float32
-        6. GaussianNoise(mean=0.0, std=(0.01,0.05))← Tensor stage (MUST be after ToTensor)
-        7. Normalize(mean=[0.5], std=[0.5])        ← Tensor stage (single-element lists!)
+    Build the augmentation pipeline for TRAINING data only.
 
     Args:
-        img_size: not used directly (resizing done in Dataset.__getitem__).
+        img_size (int): kept for API consistency with get_val_transforms.
+                        Not used internally — resizing is done in the Dataset.
 
     Returns:
-        transforms.Compose instance
+        transforms.Compose instance with the following stages IN THIS EXACT ORDER:
+
+        Stage 1 — PIL stage (input must be PIL Image mode 'L'):
+            transforms.RandomRotation(
+                degrees=15,
+                fill=0,
+                interpolation=transforms.InterpolationMode.BILINEAR,
+            )
+            Rotates by angle sampled from [-15, 15] degrees.
+            fill=0 means out-of-bounds pixels become black (correct for binary images).
+            SRS ref: Module 4 FE-1
+
+            transforms.RandomHorizontalFlip(p=0.5)
+            50% chance of horizontal flip.
+            SRS ref: Module 4 FE-1
+
+            transforms.RandomVerticalFlip(p=0.5)
+            50% chance of vertical flip.
+            SRS ref: Module 4 FE-1
+
+            transforms.ColorJitter(brightness=0.2)
+            Randomly adjusts brightness by factor in [0.8, 1.2].
+            Works on PIL Image — must be BEFORE ToTensor.
+            SRS ref: Module 4 FE-1
+
+        Stage 2 — Conversion:
+            transforms.ToTensor()
+            Converts PIL Image mode 'L' to tensor shape (1, H, W), values [0.0, 1.0].
+            This is the PIL→tensor boundary. Everything before is PIL. Everything after is tensor.
+
+        Stage 3 — Tensor stage (input must be torch.Tensor):
+            GaussianNoise(mean=0.0, std_range=(0.01, 0.05))
+            Applied AFTER ToTensor. Adds noise, clamps to [0.0, 1.0].
+            SRS ref: Module 4 FE-2
+
+            transforms.Normalize(mean=[0.5], std=[0.5])
+            Maps [0.0, 1.0] → [-1.0, 1.0].
+            Single-element lists. MUST be last.
+
+    CRITICAL: The order above is non-negotiable. Any reordering will break the pipeline.
     """
     return transforms.Compose([
-        transforms.RandomRotation(degrees=15, fill=0),
+        # Stage 1 — PIL transforms
+        transforms.RandomRotation(
+            degrees=15,
+            fill=0,
+            interpolation=transforms.InterpolationMode.BILINEAR,
+        ),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomVerticalFlip(p=0.5),
-        transforms.ColorJitter(brightness=0.2),    # PIL stage — before ToTensor
+        transforms.ColorJitter(brightness=0.2),
+        # Stage 2 — Conversion
         transforms.ToTensor(),
-        GaussianNoise(mean=0.0, std_range=(0.01, 0.05)),  # Tensor stage — after ToTensor
-        transforms.Normalize(mean=[0.5], std=[0.5]),       # single-element lists
+        # Stage 3 — Tensor transforms
+        GaussianNoise(mean=0.0, std_range=(0.01, 0.05)),
+        transforms.Normalize(mean=[0.5], std=[0.5]),
     ])
 
 
 def get_val_transforms(img_size: int = 128) -> transforms.Compose:
     """
-    Build the inference/validation transform pipeline (NO augmentation).
-
-    Transform order:
-        1. ToTensor()                       ← PIL 'L' → (1, H, W) float32
-        2. Normalize(mean=[0.5], std=[0.5]) ← maps [0,1] to [-1,1]
-
-    Used for val, test, and inference. NEVER use get_train_transforms for inference.
+    Build the inference/validation transform pipeline.
+    NO augmentation. Fully deterministic.
 
     Args:
-        img_size: kept for API consistency, not used here.
+        img_size (int): kept for API consistency. Not used internally.
 
     Returns:
-        transforms.Compose instance
+        transforms.Compose with exactly two stages:
+
+            transforms.ToTensor()
+            Converts PIL Image mode 'L' to tensor (1, H, W), values [0.0, 1.0].
+
+            transforms.Normalize(mean=[0.5], std=[0.5])
+            Maps [0.0, 1.0] → [-1.0, 1.0].
+            Single-element lists.
+
+    USED FOR: validation set, test set, and all dashboard inference.
+    NEVER used for training.
     """
     return transforms.Compose([
         transforms.ToTensor(),
@@ -552,553 +259,821 @@ def get_val_transforms(img_size: int = 128) -> transforms.Compose:
 
 ---
 
-## File 6: `modules/enhancement/balancer.py`
+## FILE 2: `modules/enhancement/balancer.py`
 
 ```python
-# modules/enhancement/balancer.py
+"""
+Class-aware oversampling for the Malimg dataset.
+
+Malimg is severely class-imbalanced:
+    Allaple.A  → 2949 samples  (most)
+    Skintrim.N → 80   samples  (fewest)
+    Ratio      → ~37x imbalance
+
+Without balancing the CNN learns to predict majority classes and ignores rare families.
+WeightedRandomSampler gives each class equal expected representation per epoch.
+
+SRS ref: Module 4 FE-3
+"""
 import math
+from collections import Counter
+
 import torch
 from torch.utils.data import WeightedRandomSampler
-from collections import Counter
 
 
 class ClassAwareOversampler:
     """
-    Produces a WeightedRandomSampler to address class imbalance in Malimg.
-
-    Malimg is severely imbalanced (Allaple.A has ~2949 samples, Skintrim.N has ~80).
-    Without balancing, the CNN learns to predict majority classes and performs
-    poorly on rare families.
+    Produces a WeightedRandomSampler to address class imbalance.
 
     Constructor args:
-        dataset:  a MalimgDataset instance (train split).
-                  Must expose a get_labels() method returning list[int].
-        strategy: one of 'oversample_minority', 'sqrt_inverse', 'uniform'.
+        dataset:          any object with a get_labels() method that returns list[int].
+                          In practice this is a MalimgDataset training split instance.
+        strategy (str):   one of:
+            'oversample_minority' — weight = 1.0 / class_count
+                                    Minority classes appear as often as majority.
+                                    Best for severe imbalance.
+            'sqrt_inverse'        — weight = 1.0 / sqrt(class_count)
+                                    Softer balancing. Preserves some natural distribution.
+                                    Best for moderate imbalance.
+            'uniform'             — weight = 1.0 for all classes regardless of count.
+                                    Effectively random sampling. Use for ablation.
 
-    Strategies:
-        'oversample_minority' — weight = 1 / class_count (pure inverse frequency)
-        'sqrt_inverse'        — weight = 1 / sqrt(class_count) (softer balancing)
-        'uniform'             — weight = 1.0 for all samples (effectively random sampling)
+    Raises:
+        ValueError: f"Unknown oversampling strategy: '{strategy}'. "
+                    f"Must be one of: oversample_minority, sqrt_inverse, uniform"
+            if strategy is not one of the three valid values.
 
-    Properties set after get_sampler() call:
+    Attributes set after get_sampler() is called:
         self.class_weights: dict[int, float]
-        self.effective_class_counts: dict[int, float]
+            Computed weight per integer class label.
+            Set inside get_sampler() before returning.
+
+    get_sampler() -> WeightedRandomSampler:
+        Steps (implement exactly):
+
+            1. Get labels:
+                   labels = self.dataset.get_labels()    # list[int]
+
+            2. Count per class:
+                   class_counts = Counter(labels)        # {class_int: count}
+
+            3. Compute class weights based on strategy:
+                   if strategy == 'oversample_minority':
+                       class_weights = {c: 1.0 / count
+                                        for c, count in class_counts.items()}
+                   elif strategy == 'sqrt_inverse':
+                       class_weights = {c: 1.0 / math.sqrt(count)
+                                        for c, count in class_counts.items()}
+                   elif strategy == 'uniform':
+                       class_weights = {c: 1.0 for c in class_counts}
+
+            4. Assign to instance attribute:
+                   self.class_weights = class_weights
+
+            5. Build per-sample weight tensor:
+                   sample_weights = torch.tensor(
+                       [class_weights[label] for label in labels],
+                       dtype=torch.float32,
+                   )
+
+            6. Return sampler:
+                   return WeightedRandomSampler(
+                       weights=sample_weights,
+                       num_samples=len(labels),   # one full epoch worth of samples
+                       replacement=True,          # MUST be True for oversampling
+                   )
+
+    Notes:
+        - replacement=True is mandatory. Without it, oversampling minority classes
+          is impossible since you cannot draw more samples than exist.
+        - num_samples=len(labels) ensures each epoch sees the same number of
+          gradient updates regardless of class distribution changes.
+        - self.class_weights is set as a side effect of get_sampler().
+          Tests access it after calling get_sampler().
     """
 
-    def __init__(self, dataset, strategy: str = 'oversample_minority'):
-        self.dataset = dataset
+    def __init__(self, dataset, strategy: str = "oversample_minority") -> None:
+        valid = {"oversample_minority", "sqrt_inverse", "uniform"}
+        if strategy not in valid:
+            raise ValueError(
+                f"Unknown oversampling strategy: '{strategy}'. "
+                f"Must be one of: oversample_minority, sqrt_inverse, uniform"
+            )
+        self.dataset  = dataset
         self.strategy = strategy
-        self.class_weights: dict[int, float] = {}
-        self.effective_class_counts: dict[int, float] = {}
+        self.class_weights: dict = {}   # populated by get_sampler()
 
     def get_sampler(self) -> WeightedRandomSampler:
-        """
-        Compute per-sample weights and return a WeightedRandomSampler.
-
-        Implementation:
-            labels = dataset.get_labels()
-            class_counts = Counter(labels)
-
-            if strategy == 'oversample_minority':
-                class_weights = {c: 1.0 / count for c, count in class_counts.items()}
-            elif strategy == 'sqrt_inverse':
-                class_weights = {c: 1.0 / math.sqrt(count) for c, count in class_counts.items()}
-            elif strategy == 'uniform':
-                class_weights = {c: 1.0 for c in class_counts}
-            else:
-                raise ValueError(f"Unknown strategy: {strategy}")
-
-            sample_weights = [class_weights[label] for label in labels]
-            return WeightedRandomSampler(
-                weights=torch.tensor(sample_weights, dtype=torch.float32),
-                num_samples=len(labels),
-                replacement=True,
-            )
-        """
-        labels = self.dataset.get_labels()
-        class_counts = Counter(labels)
-
-        if self.strategy == 'oversample_minority':
-            self.class_weights = {c: 1.0 / count for c, count in class_counts.items()}
-        elif self.strategy == 'sqrt_inverse':
-            self.class_weights = {c: 1.0 / math.sqrt(count) for c, count in class_counts.items()}
-        elif self.strategy == 'uniform':
-            self.class_weights = {c: 1.0 for c in class_counts}
-        else:
-            raise ValueError(f"Unknown strategy: {self.strategy}. "
-                             "Choose from: oversample_minority, sqrt_inverse, uniform")
-
-        total_weight = sum(self.class_weights.values())
-        n = len(labels)
-        self.effective_class_counts = {
-            c: self.class_weights[c] / total_weight * n
-            for c in self.class_weights
-        }
-
-        sample_weights = torch.tensor(
-            [self.class_weights[label] for label in labels],
-            dtype=torch.float32,
-        )
-
-        return WeightedRandomSampler(
-            weights=sample_weights,
-            num_samples=len(labels),
-            replacement=True,
-        )
+        # implement here
+        ...
 ```
 
 ---
 
-## File 7: `tests/test_dataset.py`
+## FILE 3: `modules/enhancement/__init__.py`
 
-Write this file **exactly** as shown. Do not add, remove, or rename any test.
+```python
+from .augmentor import GaussianNoise, get_train_transforms, get_val_transforms
+from .balancer import ClassAwareOversampler
+
+__all__ = [
+    "GaussianNoise",
+    "get_train_transforms",
+    "get_val_transforms",
+    "ClassAwareOversampler",
+]
+```
+
+---
+
+## FILE 4: `tests/test_enhancement.py`
+
+Implement all test classes and methods exactly as written. Do not skip or rename any.
 
 ```python
 """
-Test suite for modules/dataset/
-NOTE: Tests that require the Malimg dataset are marked @pytest.mark.integration.
-Unit tests (no dataset needed) run without the dataset.
-
-Run unit tests only (CI-safe):
-    pytest tests/test_dataset.py -v -m "not integration"
-
-Run all tests (requires Malimg at config.DATA_DIR):
-    pytest tests/test_dataset.py -v
+Test suite for modules/enhancement/
+All tests are unit tests — no Malimg dataset required.
+Run: pytest tests/test_enhancement.py -v
 """
+import numpy as np
 import pytest
+import torch
+from PIL import Image
+from torch.utils.data import WeightedRandomSampler
+
+from modules.enhancement.augmentor import (
+    GaussianNoise,
+    get_train_transforms,
+    get_val_transforms,
+)
+from modules.enhancement.balancer import ClassAwareOversampler
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def make_pil_grayscale(size: int = 128, seed: int = 0) -> Image.Image:
+    """Create a deterministic grayscale PIL Image in mode 'L'."""
+    rng = np.random.default_rng(seed=seed)
+    arr = rng.integers(0, 256, size=(size, size), dtype=np.uint8)
+    return Image.fromarray(arr, mode='L')
+
+
+def make_tensor(size: int = 128, seed: int = 0) -> torch.Tensor:
+    """Create a deterministic float32 tensor in [0, 1], shape (1, size, size)."""
+    rng = np.random.default_rng(seed=seed)
+    arr = rng.random(size=(1, size, size)).astype(np.float32)
+    return torch.from_numpy(arr)
+
+
+class MockDataset:
+    """
+    Minimal mock dataset for balancer tests.
+    Exposes get_labels() and __len__() only.
+    """
+    def __init__(self, labels: list[int]) -> None:
+        self._labels = labels
+
+    def get_labels(self) -> list[int]:
+        return list(self._labels)
+
+    def __len__(self) -> int:
+        return len(self._labels)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GaussianNoise
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestGaussianNoise:
+
+    def test_output_same_shape_as_input(self):
+        noise = GaussianNoise()
+        t = make_tensor(128)
+        assert noise(t).shape == t.shape
+
+    def test_output_same_dtype_as_input(self):
+        noise = GaussianNoise()
+        t = make_tensor()
+        assert noise(t).dtype == t.dtype
+
+    def test_output_clamped_min_zero(self):
+        """Output must never be below 0.0."""
+        noise = GaussianNoise(std_range=(0.5, 1.0))   # large noise to stress-test clamping
+        t = torch.zeros(1, 128, 128)
+        result = noise(t)
+        assert result.min().item() >= 0.0
+
+    def test_output_clamped_max_one(self):
+        """Output must never exceed 1.0."""
+        noise = GaussianNoise(std_range=(0.5, 1.0))
+        t = torch.ones(1, 128, 128)
+        result = noise(t)
+        assert result.max().item() <= 1.0
+
+    def test_clamping_with_extreme_noise(self):
+        """Very high std should still produce valid output."""
+        noise = GaussianNoise(std_range=(10.0, 20.0))
+        t = make_tensor()
+        result = noise(t)
+        assert result.min().item() >= 0.0
+        assert result.max().item() <= 1.0
+
+    def test_noise_actually_changes_values(self):
+        """Noise must actually modify the tensor (not a no-op)."""
+        noise = GaussianNoise(std_range=(0.1, 0.2))
+        t = torch.full((1, 128, 128), 0.5)
+        result = noise(t)
+        assert not torch.equal(result, t)
+
+    def test_different_calls_produce_different_outputs(self):
+        """Each call samples a fresh noise tensor — outputs must differ."""
+        noise = GaussianNoise(std_range=(0.1, 0.2))
+        t = torch.full((1, 128, 128), 0.5)
+        r1 = noise(t)
+        r2 = noise(t)
+        # Two independent calls should differ (probability of exact equality is ~0)
+        assert not torch.equal(r1, r2)
+
+    def test_zero_std_range_is_identity(self):
+        """With std_range=(0, 0), mean=0: adds zero noise → output equals input."""
+        noise = GaussianNoise(mean=0.0, std_range=(0.0, 0.0))
+        t = make_tensor()
+        result = noise(t)
+        torch.testing.assert_close(result, t)
+
+    def test_output_on_zero_tensor_clamped_correctly(self):
+        """Black image + noise → some values rise, none fall below 0."""
+        noise = GaussianNoise(std_range=(0.05, 0.1))
+        t = torch.zeros(1, 128, 128)
+        result = noise(t)
+        assert result.min().item() >= 0.0
+        assert result.max().item() <= 1.0
+
+    def test_repr_contains_class_name(self):
+        noise = GaussianNoise(mean=0.0, std_range=(0.01, 0.05))
+        assert "GaussianNoise" in repr(noise)
+
+    def test_repr_contains_mean(self):
+        noise = GaussianNoise(mean=0.0, std_range=(0.01, 0.05))
+        assert "0.0" in repr(noise)
+
+    def test_output_is_float32(self):
+        noise = GaussianNoise()
+        t = torch.rand(1, 64, 64, dtype=torch.float32)
+        result = noise(t)
+        assert result.dtype == torch.float32
+
+    def test_works_on_batch_tensor(self):
+        """Should work on (B, 1, H, W) tensors too (not just (1, H, W))."""
+        noise = GaussianNoise()
+        t = torch.rand(4, 1, 128, 128)
+        result = noise(t)
+        assert result.shape == (4, 1, 128, 128)
+        assert result.min().item() >= 0.0
+        assert result.max().item() <= 1.0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# get_train_transforms
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestGetTrainTransforms:
+
+    def test_returns_compose(self):
+        from torchvision.transforms import Compose
+        assert isinstance(get_train_transforms(128), Compose)
+
+    def test_output_tensor_shape(self):
+        transform = get_train_transforms(128)
+        pil = make_pil_grayscale(128)
+        result = transform(pil)
+        assert result.shape == (1, 128, 128)
+
+    def test_output_dtype_float32(self):
+        transform = get_train_transforms(128)
+        result = transform(make_pil_grayscale(128))
+        assert result.dtype == torch.float32
+
+    def test_output_is_tensor(self):
+        transform = get_train_transforms(128)
+        result = transform(make_pil_grayscale(128))
+        assert isinstance(result, torch.Tensor)
+
+    def test_output_range_after_normalize(self):
+        """
+        After Normalize(mean=[0.5], std=[0.5]) the theoretical range is [-1, 1].
+        With GaussianNoise applied before Normalize, the values could be slightly
+        outside [-1, 1] but GaussianNoise clamps to [0, 1] first, so after Normalize
+        output is in [-1, 1].
+        We check a relaxed range to account for float precision.
+        """
+        transform = get_train_transforms(128)
+        for seed in range(5):
+            pil = make_pil_grayscale(128, seed=seed)
+            result = transform(pil)
+            assert result.min().item() >= -1.05, f"seed={seed}: min={result.min().item()}"
+            assert result.max().item() <= 1.05,  f"seed={seed}: max={result.max().item()}"
+
+    def test_pure_black_image_normalizes_to_minus_one(self):
+        """
+        Black image (all zeros) → ToTensor → [0.0] → GaussianNoise adds small noise
+        → clamped back → Normalize(0.5, 0.5): (0 - 0.5) / 0.5 = -1.0
+        With noise the result is close to -1.0 but not exact.
+        """
+        transform = get_train_transforms(128)
+        black = Image.fromarray(np.zeros((128, 128), dtype=np.uint8), mode='L')
+        # Run multiple times; all should be close to -1
+        for _ in range(3):
+            result = transform(black)
+            assert result.mean().item() > -1.1   # with noise it won't be exactly -1
+
+    def test_accepts_pil_l_mode_input(self):
+        """Transform must work on PIL Image mode 'L' without raising."""
+        transform = get_train_transforms(128)
+        pil = Image.fromarray(np.zeros((128, 128), dtype=np.uint8), mode='L')
+        result = transform(pil)   # must not raise
+        assert result is not None
+
+    def test_stochastic_produces_different_results_on_same_input(self):
+        """
+        Training transforms are stochastic. Two calls on identical input
+        should produce different tensors (with overwhelming probability).
+        """
+        transform = get_train_transforms(128)
+        pil = make_pil_grayscale(128, seed=7)
+        outputs = [transform(pil) for _ in range(5)]
+        # At least two outputs should differ
+        all_equal = all(torch.equal(outputs[0], o) for o in outputs[1:])
+        assert not all_equal, "Training transforms appear to be deterministic — check stochastic stages"
+
+    def test_contains_gaussian_noise(self):
+        """Pipeline must include GaussianNoise after ToTensor."""
+        transform = get_train_transforms(128)
+        has_gaussian = any(isinstance(t, GaussianNoise) for t in transform.transforms)
+        assert has_gaussian, "get_train_transforms must include GaussianNoise"
+
+    def test_contains_to_tensor(self):
+        from torchvision.transforms import ToTensor
+        transform = get_train_transforms(128)
+        has_to_tensor = any(isinstance(t, ToTensor) for t in transform.transforms)
+        assert has_to_tensor, "get_train_transforms must include ToTensor"
+
+    def test_contains_normalize(self):
+        from torchvision.transforms import Normalize
+        transform = get_train_transforms(128)
+        has_normalize = any(isinstance(t, Normalize) for t in transform.transforms)
+        assert has_normalize, "get_train_transforms must include Normalize"
+
+    def test_gaussian_noise_comes_after_to_tensor(self):
+        """
+        GaussianNoise must be positioned after ToTensor in the pipeline.
+        Verify by checking index positions.
+        """
+        from torchvision.transforms import ToTensor
+        transform = get_train_transforms(128)
+        ts = transform.transforms
+        to_tensor_idx   = next(i for i, t in enumerate(ts) if isinstance(t, ToTensor))
+        gaussian_idx    = next(i for i, t in enumerate(ts) if isinstance(t, GaussianNoise))
+        assert gaussian_idx > to_tensor_idx, (
+            f"GaussianNoise (idx={gaussian_idx}) must come after "
+            f"ToTensor (idx={to_tensor_idx})"
+        )
+
+    def test_normalize_is_last_transform(self):
+        from torchvision.transforms import Normalize
+        transform = get_train_transforms(128)
+        last = transform.transforms[-1]
+        assert isinstance(last, Normalize), (
+            f"Last transform must be Normalize, got {type(last).__name__}"
+        )
+
+    def test_color_jitter_comes_before_to_tensor(self):
+        """ColorJitter operates on PIL — must be before ToTensor."""
+        from torchvision.transforms import ColorJitter, ToTensor
+        transform = get_train_transforms(128)
+        ts = transform.transforms
+        to_tensor_idx = next(i for i, t in enumerate(ts) if isinstance(t, ToTensor))
+        jitter_indices = [i for i, t in enumerate(ts) if isinstance(t, ColorJitter)]
+        assert len(jitter_indices) > 0, "get_train_transforms must include ColorJitter"
+        assert all(idx < to_tensor_idx for idx in jitter_indices), (
+            "ColorJitter must come before ToTensor"
+        )
+
+    def test_more_transforms_than_val(self):
+        """Train pipeline has more transforms than val pipeline."""
+        train_tf = get_train_transforms(128)
+        val_tf   = get_val_transforms(128)
+        assert len(train_tf.transforms) > len(val_tf.transforms)
+
+    def test_normalize_uses_single_channel_params(self):
+        """Normalize must use mean=[0.5], std=[0.5] — single-element lists."""
+        from torchvision.transforms import Normalize
+        transform = get_train_transforms(128)
+        normalize = next(t for t in transform.transforms if isinstance(t, Normalize))
+        assert list(normalize.mean) == [0.5], f"Expected mean=[0.5], got {normalize.mean}"
+        assert list(normalize.std)  == [0.5], f"Expected std=[0.5],  got {normalize.std}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# get_val_transforms
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestGetValTransforms:
+
+    def test_returns_compose(self):
+        from torchvision.transforms import Compose
+        assert isinstance(get_val_transforms(128), Compose)
+
+    def test_output_tensor_shape(self):
+        transform = get_val_transforms(128)
+        result = transform(make_pil_grayscale(128))
+        assert result.shape == (1, 128, 128)
+
+    def test_output_dtype_float32(self):
+        transform = get_val_transforms(128)
+        result = transform(make_pil_grayscale(128))
+        assert result.dtype == torch.float32
+
+    def test_is_deterministic(self):
+        """Same input must always produce exactly the same tensor."""
+        transform = get_val_transforms(128)
+        arr = np.random.default_rng(seed=42).integers(0,256,(128,128),dtype=np.uint8)
+        pil1 = Image.fromarray(arr, mode='L')
+        pil2 = Image.fromarray(arr, mode='L')
+        r1 = transform(pil1)
+        r2 = transform(pil2)
+        torch.testing.assert_close(r1, r2)
+
+    def test_pure_black_image_outputs_minus_one(self):
+        """Black image → ToTensor → 0.0 → Normalize(0.5,0.5) → -1.0"""
+        transform = get_val_transforms(128)
+        black = Image.fromarray(np.zeros((128, 128), dtype=np.uint8), mode='L')
+        result = transform(black)
+        torch.testing.assert_close(result, torch.full((1, 128, 128), -1.0))
+
+    def test_pure_white_image_outputs_plus_one(self):
+        """White image → ToTensor → 1.0 → Normalize(0.5,0.5) → 1.0"""
+        transform = get_val_transforms(128)
+        white = Image.fromarray(np.full((128, 128), 255, dtype=np.uint8), mode='L')
+        result = transform(white)
+        torch.testing.assert_close(result, torch.full((1, 128, 128), 1.0), atol=1e-5, rtol=0)
+
+    def test_output_range_is_minus_one_to_plus_one(self):
+        transform = get_val_transforms(128)
+        for seed in range(5):
+            result = transform(make_pil_grayscale(128, seed=seed))
+            assert result.min().item() >= -1.0 - 1e-5
+            assert result.max().item() <= 1.0  + 1e-5
+
+    def test_does_not_contain_gaussian_noise(self):
+        transform = get_val_transforms(128)
+        has_gaussian = any(isinstance(t, GaussianNoise) for t in transform.transforms)
+        assert not has_gaussian, "get_val_transforms must NOT include GaussianNoise"
+
+    def test_does_not_contain_random_flip(self):
+        from torchvision.transforms import RandomHorizontalFlip, RandomVerticalFlip
+        transform = get_val_transforms(128)
+        for t in transform.transforms:
+            assert not isinstance(t, (RandomHorizontalFlip, RandomVerticalFlip)), \
+                "get_val_transforms must not contain random flips"
+
+    def test_does_not_contain_random_rotation(self):
+        from torchvision.transforms import RandomRotation
+        transform = get_val_transforms(128)
+        for t in transform.transforms:
+            assert not isinstance(t, RandomRotation), \
+                "get_val_transforms must not contain RandomRotation"
+
+    def test_does_not_contain_color_jitter(self):
+        from torchvision.transforms import ColorJitter
+        transform = get_val_transforms(128)
+        for t in transform.transforms:
+            assert not isinstance(t, ColorJitter), \
+                "get_val_transforms must not contain ColorJitter"
+
+    def test_exactly_two_transforms(self):
+        """Val pipeline must have exactly: ToTensor, Normalize."""
+        transform = get_val_transforms(128)
+        assert len(transform.transforms) == 2, (
+            f"Expected exactly 2 transforms, got {len(transform.transforms)}: "
+            f"{[type(t).__name__ for t in transform.transforms]}"
+        )
+
+    def test_normalize_uses_single_channel_params(self):
+        from torchvision.transforms import Normalize
+        transform = get_val_transforms(128)
+        normalize = next(t for t in transform.transforms if isinstance(t, Normalize))
+        assert list(normalize.mean) == [0.5]
+        assert list(normalize.std)  == [0.5]
+
+    def test_accepts_pil_l_mode_input(self):
+        transform = get_val_transforms(128)
+        pil = Image.fromarray(np.zeros((128, 128), dtype=np.uint8), mode='L')
+        result = transform(pil)
+        assert result is not None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ClassAwareOversampler
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestClassAwareOversamplerInit:
+
+    def test_invalid_strategy_raises_value_error(self):
+        ds = MockDataset([0, 1, 2])
+        with pytest.raises(ValueError, match="Unknown oversampling strategy"):
+            ClassAwareOversampler(ds, strategy="nonexistent")
+
+    def test_valid_strategies_do_not_raise(self):
+        ds = MockDataset([0, 1, 2])
+        for strategy in ["oversample_minority", "sqrt_inverse", "uniform"]:
+            ClassAwareOversampler(ds, strategy=strategy)   # must not raise
+
+    def test_stores_strategy(self):
+        ds = MockDataset([0, 1, 2])
+        o = ClassAwareOversampler(ds, strategy="uniform")
+        assert o.strategy == "uniform"
+
+    def test_default_strategy_is_oversample_minority(self):
+        ds = MockDataset([0, 1, 2])
+        o = ClassAwareOversampler(ds)
+        assert o.strategy == "oversample_minority"
+
+
+class TestClassAwareOversamplerGetSampler:
+
+    def test_returns_weighted_random_sampler(self):
+        ds = MockDataset([0] * 100 + [1] * 10 + [2] * 5)
+        sampler = ClassAwareOversampler(ds).get_sampler()
+        assert isinstance(sampler, WeightedRandomSampler)
+
+    def test_num_samples_equals_dataset_length(self):
+        labels = [0] * 100 + [1] * 10 + [2] * 5
+        ds = MockDataset(labels)
+        sampler = ClassAwareOversampler(ds).get_sampler()
+        assert sampler.num_samples == len(labels)
+
+    def test_replacement_is_true(self):
+        ds = MockDataset([0] * 50 + [1] * 5)
+        sampler = ClassAwareOversampler(ds).get_sampler()
+        assert sampler.replacement is True
+
+    def test_class_weights_set_as_attribute(self):
+        """class_weights dict must be accessible after get_sampler() is called."""
+        ds = MockDataset([0] * 100 + [1] * 10)
+        o = ClassAwareOversampler(ds)
+        o.get_sampler()
+        assert hasattr(o, 'class_weights')
+        assert isinstance(o.class_weights, dict)
+        assert 0 in o.class_weights
+        assert 1 in o.class_weights
+
+    def test_oversample_minority_weights_minority_higher(self):
+        """Class 1 (10 samples) must get higher weight than class 0 (100 samples)."""
+        ds = MockDataset([0] * 100 + [1] * 10)
+        o = ClassAwareOversampler(ds, strategy="oversample_minority")
+        o.get_sampler()
+        assert o.class_weights[1] > o.class_weights[0], (
+            f"Minority class weight {o.class_weights[1]} should be > "
+            f"majority class weight {o.class_weights[0]}"
+        )
+
+    def test_oversample_minority_weight_formula(self):
+        """Weight must be exactly 1.0 / count for each class."""
+        labels = [0] * 100 + [1] * 20 + [2] * 5
+        ds = MockDataset(labels)
+        o = ClassAwareOversampler(ds, strategy="oversample_minority")
+        o.get_sampler()
+        assert abs(o.class_weights[0] - 1.0 / 100) < 1e-9
+        assert abs(o.class_weights[1] - 1.0 / 20)  < 1e-9
+        assert abs(o.class_weights[2] - 1.0 / 5)   < 1e-9
+
+    def test_sqrt_inverse_weight_formula(self):
+        """Weight must be exactly 1.0 / sqrt(count) for each class."""
+        import math
+        labels = [0] * 100 + [1] * 25
+        ds = MockDataset(labels)
+        o = ClassAwareOversampler(ds, strategy="sqrt_inverse")
+        o.get_sampler()
+        assert abs(o.class_weights[0] - 1.0 / math.sqrt(100)) < 1e-9
+        assert abs(o.class_weights[1] - 1.0 / math.sqrt(25))  < 1e-9
+
+    def test_sqrt_inverse_minority_still_weighted_higher(self):
+        """Even with sqrt_inverse, minority should weigh more than majority."""
+        ds = MockDataset([0] * 100 + [1] * 10)
+        o = ClassAwareOversampler(ds, strategy="sqrt_inverse")
+        o.get_sampler()
+        assert o.class_weights[1] > o.class_weights[0]
+
+    def test_uniform_all_weights_equal_one(self):
+        labels = [0] * 100 + [1] * 10 + [2] * 5
+        ds = MockDataset(labels)
+        o = ClassAwareOversampler(ds, strategy="uniform")
+        o.get_sampler()
+        for cls, weight in o.class_weights.items():
+            assert abs(weight - 1.0) < 1e-9, f"Class {cls} weight should be 1.0, got {weight}"
+
+    def test_uniform_sampler_weights_per_sample_all_equal(self):
+        """With uniform strategy, every sample has the same weight."""
+        labels = [0] * 100 + [1] * 10
+        ds = MockDataset(labels)
+        sampler = ClassAwareOversampler(ds, strategy="uniform").get_sampler()
+        weights = sampler.weights
+        assert torch.allclose(weights, torch.ones_like(weights)), \
+            "Uniform strategy should give all samples weight 1.0"
+
+    def test_sample_weights_tensor_is_float32(self):
+        ds = MockDataset([0] * 50 + [1] * 50)
+        sampler = ClassAwareOversampler(ds).get_sampler()
+        assert sampler.weights.dtype == torch.float32
+
+    def test_sample_weights_length_equals_dataset(self):
+        labels = [0] * 80 + [1] * 20
+        ds = MockDataset(labels)
+        sampler = ClassAwareOversampler(ds).get_sampler()
+        assert len(sampler.weights) == len(labels)
+
+    def test_all_sample_weights_positive(self):
+        """No sample should have zero or negative weight."""
+        labels = [0] * 100 + [1] * 10 + [2] * 5
+        ds = MockDataset(labels)
+        sampler = ClassAwareOversampler(ds).get_sampler()
+        assert (sampler.weights > 0).all()
+
+    def test_works_with_single_class(self):
+        """Edge case: all samples belong to one class."""
+        ds = MockDataset([0] * 50)
+        sampler = ClassAwareOversampler(ds).get_sampler()
+        assert isinstance(sampler, WeightedRandomSampler)
+        assert sampler.num_samples == 50
+
+    def test_works_with_25_classes(self, sample_class_names):
+        """Stress test with Malimg-like 25-class imbalanced distribution."""
+        rng = np.random.default_rng(seed=0)
+        # Simulate Malimg imbalance: classes 0-24 with varying counts
+        labels = []
+        counts = [2949, 1591, 800, 431, 408, 381, 213, 200, 198, 184,
+                  177, 162, 159, 158, 146, 142, 136, 132, 128, 123,
+                  122, 116, 106, 97, 80]
+        for cls, count in enumerate(counts):
+            labels.extend([cls] * count)
+        ds = MockDataset(labels)
+        sampler = ClassAwareOversampler(ds, strategy="oversample_minority").get_sampler()
+        assert isinstance(sampler, WeightedRandomSampler)
+        assert sampler.num_samples == len(labels)
+
+    def test_minority_class_has_highest_weight_in_25_class(self, sample_class_names):
+        """Skintrim.N (class 24, 80 samples) should have highest weight."""
+        counts = [2949, 1591, 800, 431, 408, 381, 213, 200, 198, 184,
+                  177, 162, 159, 158, 146, 142, 136, 132, 128, 123,
+                  122, 116, 106, 97, 80]
+        labels = []
+        for cls, count in enumerate(counts):
+            labels.extend([cls] * count)
+        ds = MockDataset(labels)
+        o = ClassAwareOversampler(ds, strategy="oversample_minority")
+        o.get_sampler()
+        max_weight_class = max(o.class_weights, key=o.class_weights.get)
+        # Class 24 has 80 samples (fewest) → highest weight
+        assert max_weight_class == 24, (
+            f"Expected class 24 (80 samples) to have highest weight, "
+            f"got class {max_weight_class}"
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Integration: transforms + oversampler work together
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestTransformOversamplerIntegration:
+
+    def test_train_transforms_output_compatible_with_model_input(self):
+        """
+        Output of get_train_transforms must be directly usable as CNN input.
+        Shape: (1, 128, 128) — single channel, 128x128.
+        dtype: float32.
+        """
+        transform = get_train_transforms(128)
+        pil = make_pil_grayscale(128)
+        tensor = transform(pil)
+        assert tensor.shape == (1, 128, 128)
+        assert tensor.dtype == torch.float32
+
+    def test_val_transforms_output_compatible_with_model_input(self):
+        transform = get_val_transforms(128)
+        pil = make_pil_grayscale(128)
+        tensor = transform(pil)
+        assert tensor.shape == (1, 128, 128)
+        assert tensor.dtype == torch.float32
+
+    def test_train_and_val_differ_on_same_input(self):
+        """
+        Training transforms are stochastic. They should (almost certainly)
+        produce different output than val transforms on the same input.
+        Test across multiple seeds for robustness.
+        """
+        train_tf = get_train_transforms(128)
+        val_tf   = get_val_transforms(128)
+        found_difference = False
+        for seed in range(10):
+            pil_for_train = make_pil_grayscale(128, seed=seed)
+            pil_for_val   = make_pil_grayscale(128, seed=seed)   # identical image
+            t_out = train_tf(pil_for_train)
+            v_out = val_tf(pil_for_val)
+            if not torch.equal(t_out, v_out):
+                found_difference = True
+                break
+        assert found_difference, (
+            "train and val transforms produced identical output for 10 seeds — "
+            "training transforms appear non-stochastic"
+        )
+
+    def test_oversampler_can_be_used_with_dataloader(self):
+        """
+        WeightedRandomSampler from ClassAwareOversampler must be accepted by
+        torch.utils.data.DataLoader without error.
+        """
+        from torch.utils.data import DataLoader, TensorDataset
+
+        # Build a tiny fake dataset with 3 classes (20 + 5 + 2 = 27 samples)
+        labels = [0] * 20 + [1] * 5 + [2] * 2
+
+        class FakeDataset:
+            def __init__(self, labels):
+                self._labels = labels
+                self._data = [
+                    (torch.zeros(1, 128, 128), lbl)
+                    for lbl in labels
+                ]
+            def get_labels(self):
+                return list(self._labels)
+            def __len__(self):
+                return len(self._labels)
+            def __getitem__(self, idx):
+                return self._data[idx]
+
+        ds = FakeDataset(labels)
+        sampler = ClassAwareOversampler(ds, strategy="oversample_minority").get_sampler()
+        loader = DataLoader(ds, batch_size=4, sampler=sampler)
+
+        # Draw one batch — must not raise
+        batch_data, batch_labels = next(iter(loader))
+        assert batch_data.shape == (4, 1, 128, 128)
+        assert batch_labels.shape == (4,)
+```
+
+---
+
+## DEFINITION OF DONE
+
+Before marking this phase complete, run the following and verify all pass:
+
+```bash
+# Run the full test suite for this phase
+pytest tests/test_enhancement.py -v
+
+# Expected: all tests PASSED, 0 failed, 0 errors
+# Approximate count: 65–70 test cases
+
+# Verify imports work cleanly from the project root
+python -c "
+from modules.enhancement.augmentor import get_train_transforms, get_val_transforms, GaussianNoise
+from modules.enhancement.balancer import ClassAwareOversampler
+print('All imports OK')
+
+from PIL import Image
 import numpy as np
 import torch
-from pathlib import Path
-from modules.dataset.preprocessor import (
-    normalize_image, encode_labels, validate_dataset_integrity,
-    save_class_names, load_class_names,
-)
 
+pil = Image.fromarray(np.zeros((128, 128), dtype=np.uint8), mode='L')
+t = get_train_transforms(128)(pil)
+v = get_val_transforms(128)(pil)
+print(f'Train output shape: {t.shape}  dtype: {t.dtype}  range: [{t.min():.3f}, {t.max():.3f}]')
+print(f'Val   output shape: {v.shape}  dtype: {v.dtype}  range: [{v.min():.3f}, {v.max():.3f}]')
 
-class TestNormalizeImage:
-    def test_output_range(self, sample_grayscale_array):
-        result = normalize_image(sample_grayscale_array)
-        assert result.min() >= 0.0
-        assert result.max() <= 1.0
+class MockDS:
+    def get_labels(self): return [0]*100 + [1]*10
+mock = MockDS()
+from torch.utils.data import WeightedRandomSampler
+sampler = ClassAwareOversampler(mock).get_sampler()
+print(f'Sampler type: {type(sampler).__name__}  num_samples: {sampler.num_samples}')
+"
 
-    def test_output_dtype_float32(self, sample_grayscale_array):
-        result = normalize_image(sample_grayscale_array)
-        assert result.dtype == np.float32
-
-    def test_zero_maps_to_zero(self):
-        arr = np.zeros((4, 4), dtype=np.uint8)
-        assert normalize_image(arr).max() == 0.0
-
-    def test_255_maps_to_one(self):
-        arr = np.full((4, 4), 255, dtype=np.uint8)
-        np.testing.assert_almost_equal(normalize_image(arr).min(), 1.0, decimal=6)
-
-    def test_shape_preserved(self, sample_grayscale_array):
-        result = normalize_image(sample_grayscale_array)
-        assert result.shape == sample_grayscale_array.shape
-
-    def test_midpoint_maps_correctly(self):
-        arr = np.full((4, 4), 128, dtype=np.uint8)
-        result = normalize_image(arr)
-        np.testing.assert_almost_equal(result[0, 0], 128 / 255.0, decimal=6)
-
-
-class TestEncodeLabels:
-    def test_sorted_alphabetically(self):
-        result = encode_labels(['Yuner.A', 'Allaple.A', 'VB.AT'])
-        assert result == {'Allaple.A': 0, 'VB.AT': 1, 'Yuner.A': 2}
-
-    def test_unique_integers(self):
-        families = ['A', 'B', 'C', 'D']
-        result = encode_labels(families)
-        assert len(set(result.values())) == 4
-
-    def test_range_correct(self):
-        families = ['X', 'Y', 'Z']
-        result = encode_labels(families)
-        assert set(result.values()) == {0, 1, 2}
-
-    def test_deterministic(self):
-        f = ['Yuner.A', 'Allaple.A']
-        assert encode_labels(f) == encode_labels(f)
-
-    def test_single_family(self):
-        assert encode_labels(['OnlyOne']) == {'OnlyOne': 0}
-
-    def test_order_independent(self):
-        f1 = ['C', 'A', 'B']
-        f2 = ['A', 'B', 'C']
-        assert encode_labels(f1) == encode_labels(f2)
-
-    def test_returns_dict(self):
-        result = encode_labels(['X', 'Y'])
-        assert isinstance(result, dict)
-
-    def test_all_values_are_ints(self):
-        result = encode_labels(['A', 'B', 'C'])
-        assert all(isinstance(v, int) for v in result.values())
-
-
-class TestSaveLoadClassNames:
-    def test_roundtrip(self, tmp_path):
-        names = ['Allaple.A', 'Agent.FYI', 'VB.AT']
-        path = tmp_path / 'class_names.json'
-        save_class_names(names, path)
-        loaded = load_class_names(path)
-        assert loaded == names
-
-    def test_creates_parent_dirs(self, tmp_path):
-        names = ['A', 'B']
-        path = tmp_path / 'subdir' / 'nested' / 'class_names.json'
-        save_class_names(names, path)
-        assert path.exists()
-
-    def test_load_nonexistent_raises(self, tmp_path):
-        missing = tmp_path / 'nonexistent.json'
-        with pytest.raises(FileNotFoundError, match="class_names.json not found"):
-            load_class_names(missing)
-
-    def test_file_format_correct(self, tmp_path):
-        import json
-        names = ['A', 'B', 'C']
-        path = tmp_path / 'class_names.json'
-        save_class_names(names, path)
-        with open(path) as f:
-            data = json.load(f)
-        assert 'class_names' in data
-        assert data['class_names'] == names
-
-    def test_overwrites_existing(self, tmp_path):
-        path = tmp_path / 'class_names.json'
-        save_class_names(['X'], path)
-        save_class_names(['A', 'B'], path)
-        loaded = load_class_names(path)
-        assert loaded == ['A', 'B']
-
-
-class TestValidateDatasetIntegrity:
-    def test_missing_dir_raises(self, tmp_path):
-        missing = tmp_path / 'nonexistent'
-        with pytest.raises(FileNotFoundError, match="not found"):
-            validate_dataset_integrity(missing)
-
-    def test_empty_dir_raises(self, tmp_path):
-        with pytest.raises(FileNotFoundError, match="empty"):
-            validate_dataset_integrity(tmp_path)
-
-    def test_returns_required_keys(self, tmp_path):
-        """Create a minimal fake dataset with one family and one valid PNG."""
-        import cv2
-        family_dir = tmp_path / 'FamilyA'
-        family_dir.mkdir()
-        # Create a minimal valid grayscale PNG
-        img = np.zeros((16, 16), dtype=np.uint8)
-        img_path = family_dir / 'sample.png'
-        cv2.imwrite(str(img_path), img)
-
-        report = validate_dataset_integrity(tmp_path)
-        required_keys = {
-            'valid', 'families', 'counts', 'total',
-            'min_class', 'max_class', 'imbalance_ratio',
-            'corrupt_files', 'missing_dirs'
-        }
-        assert required_keys.issubset(report.keys())
-
-    def test_counts_and_total_correct(self, tmp_path):
-        import cv2
-        for family in ['FamilyA', 'FamilyB']:
-            d = tmp_path / family
-            d.mkdir()
-            for i in range(3):
-                img = np.zeros((16, 16), dtype=np.uint8)
-                cv2.imwrite(str(d / f'img{i}.png'), img)
-
-        report = validate_dataset_integrity(tmp_path)
-        assert report['total'] == 6
-        assert report['counts']['FamilyA'] == 3
-        assert report['counts']['FamilyB'] == 3
-
-    def test_corrupt_file_detection(self, tmp_path):
-        """A corrupt PNG (not a valid image) should appear in corrupt_files."""
-        family_dir = tmp_path / 'FamilyA'
-        family_dir.mkdir()
-        bad_png = family_dir / 'bad.png'
-        bad_png.write_bytes(b'not an image')  # cv2.imread will return None
-
-        report = validate_dataset_integrity(tmp_path)
-        assert len(report['corrupt_files']) == 1
-        assert report['valid'] is False
-
-    def test_families_sorted(self, tmp_path):
-        import cv2
-        for name in ['Zebra', 'Alligator', 'Monkey']:
-            d = tmp_path / name
-            d.mkdir()
-            img = np.zeros((8, 8), dtype=np.uint8)
-            cv2.imwrite(str(d / 'img.png'), img)
-
-        report = validate_dataset_integrity(tmp_path)
-        assert report['families'] == ['Alligator', 'Monkey', 'Zebra']
-
-    def test_imbalance_ratio(self, tmp_path):
-        import cv2
-        # FamilyA has 1 sample, FamilyB has 4 samples → ratio = 4.0
-        for name, count in [('FamilyA', 1), ('FamilyB', 4)]:
-            d = tmp_path / name
-            d.mkdir()
-            for i in range(count):
-                img = np.zeros((8, 8), dtype=np.uint8)
-                cv2.imwrite(str(d / f'img{i}.png'), img)
-
-        report = validate_dataset_integrity(tmp_path)
-        assert abs(report['imbalance_ratio'] - 4.0) < 1e-6
-
-    def test_missing_dirs_always_empty_list(self, tmp_path):
-        import cv2
-        d = tmp_path / 'FamilyA'
-        d.mkdir()
-        img = np.zeros((8, 8), dtype=np.uint8)
-        cv2.imwrite(str(d / 'img.png'), img)
-        report = validate_dataset_integrity(tmp_path)
-        assert report['missing_dirs'] == []
-
-    @pytest.mark.integration
-    def test_malimg_dataset_valid(self):
-        """Requires real Malimg dataset at config.DATA_DIR."""
-        import config
-        if not config.DATA_DIR.exists():
-            pytest.skip("Malimg dataset not found at DATA_DIR")
-        report = validate_dataset_integrity(config.DATA_DIR)
-        assert report['total'] > 0
-        assert len(report['families']) == 25
-        assert len(report['corrupt_files']) == 0
-
-
-class TestMalimgDataset:
-    """Unit tests that build a tiny fake dataset (no real Malimg needed)."""
-
-    @pytest.fixture
-    def fake_data_dir(self, tmp_path):
-        """3 families × 5 samples each = 15 total images."""
-        import cv2
-        for family in ['FamilyA', 'FamilyB', 'FamilyC']:
-            d = tmp_path / family
-            d.mkdir()
-            for i in range(5):
-                img = np.random.randint(0, 256, (16, 16), dtype=np.uint8)
-                cv2.imwrite(str(d / f'img{i:03d}.png'), img)
-        return tmp_path
-
-    def test_invalid_split_raises(self, fake_data_dir):
-        from modules.dataset.loader import MalimgDataset
-        with pytest.raises(ValueError, match="split"):
-            MalimgDataset(fake_data_dir, 'invalid_split')
-
-    def test_missing_data_dir_raises(self, tmp_path):
-        from modules.dataset.loader import MalimgDataset
-        missing = tmp_path / 'does_not_exist'
-        with pytest.raises(FileNotFoundError):
-            MalimgDataset(missing, 'train')
-
-    def test_split_sizes_sum_to_total(self, fake_data_dir):
-        from modules.dataset.loader import MalimgDataset
-        train_ds = MalimgDataset(fake_data_dir, 'train')
-        val_ds   = MalimgDataset(fake_data_dir, 'val')
-        test_ds  = MalimgDataset(fake_data_dir, 'test')
-        total = len(train_ds) + len(val_ds) + len(test_ds)
-        assert total == 15
-
-    def test_getitem_tensor_shape(self, fake_data_dir):
-        from modules.dataset.loader import MalimgDataset
-        ds = MalimgDataset(fake_data_dir, 'train', img_size=128)
-        tensor, label = ds[0]
-        assert tensor.shape == (1, 128, 128)
-
-    def test_getitem_tensor_dtype(self, fake_data_dir):
-        from modules.dataset.loader import MalimgDataset
-        ds = MalimgDataset(fake_data_dir, 'train', img_size=128)
-        tensor, label = ds[0]
-        assert tensor.dtype == torch.float32
-
-    def test_getitem_label_is_int(self, fake_data_dir):
-        from modules.dataset.loader import MalimgDataset
-        ds = MalimgDataset(fake_data_dir, 'train', img_size=128)
-        _, label = ds[0]
-        assert isinstance(label, int)
-
-    def test_class_names_sorted(self, fake_data_dir):
-        from modules.dataset.loader import MalimgDataset
-        ds = MalimgDataset(fake_data_dir, 'train')
-        assert ds.class_names == sorted(ds.class_names)
-
-    def test_label_map_keys_match_class_names(self, fake_data_dir):
-        from modules.dataset.loader import MalimgDataset
-        ds = MalimgDataset(fake_data_dir, 'train')
-        assert set(ds.label_map.keys()) == set(ds.class_names)
-
-    def test_label_map_values_are_unique_ints(self, fake_data_dir):
-        from modules.dataset.loader import MalimgDataset
-        ds = MalimgDataset(fake_data_dir, 'train')
-        values = list(ds.label_map.values())
-        assert len(set(values)) == len(values)
-        assert all(isinstance(v, int) for v in values)
-
-    def test_get_labels_length_matches_len(self, fake_data_dir):
-        from modules.dataset.loader import MalimgDataset
-        ds = MalimgDataset(fake_data_dir, 'train')
-        assert len(ds.get_labels()) == len(ds)
-
-    def test_splits_are_reproducible(self, fake_data_dir):
-        from modules.dataset.loader import MalimgDataset
-        ds1 = MalimgDataset(fake_data_dir, 'train', random_seed=42)
-        ds2 = MalimgDataset(fake_data_dir, 'train', random_seed=42)
-        paths1 = [str(p) for p, _ in ds1.samples]
-        paths2 = [str(p) for p, _ in ds2.samples]
-        assert paths1 == paths2
-
-    def test_different_seeds_produce_different_splits(self, fake_data_dir):
-        from modules.dataset.loader import MalimgDataset
-        ds1 = MalimgDataset(fake_data_dir, 'train', random_seed=42)
-        ds2 = MalimgDataset(fake_data_dir, 'train', random_seed=99)
-        # With 15 samples, different seeds should produce different orderings
-        paths1 = set(str(p) for p, _ in ds1.samples)
-        paths2 = set(str(p) for p, _ in ds2.samples)
-        # Not guaranteed to differ but very likely with different seeds
-        # At minimum, verify no crash
-        assert isinstance(paths1, set)
-        assert isinstance(paths2, set)
-
-    @pytest.mark.integration
-    def test_malimg_split_sizes_sum_correctly(self):
-        import config
-        if not config.DATA_DIR.exists():
-            pytest.skip("Malimg dataset not found")
-        from modules.dataset.loader import MalimgDataset
-        train_ds = MalimgDataset(config.DATA_DIR, 'train')
-        val_ds   = MalimgDataset(config.DATA_DIR, 'val')
-        test_ds  = MalimgDataset(config.DATA_DIR, 'test')
-        total = len(train_ds) + len(val_ds) + len(test_ds)
-        assert 9000 < total < 9500
-
-    @pytest.mark.integration
-    def test_malimg_getitem_tensor_shape(self):
-        import config
-        if not config.DATA_DIR.exists():
-            pytest.skip("Malimg dataset not found")
-        from modules.dataset.loader import MalimgDataset
-        ds = MalimgDataset(config.DATA_DIR, 'train')
-        tensor, label = ds[0]
-        assert tensor.shape == (1, 128, 128)
-        assert tensor.dtype == torch.float32
-        assert isinstance(label, int)
-
-    @pytest.mark.integration
-    def test_malimg_all_splits_contain_all_classes(self):
-        import config
-        if not config.DATA_DIR.exists():
-            pytest.skip("Malimg dataset not found")
-        from modules.dataset.loader import MalimgDataset
-        for split in ['train', 'val', 'test']:
-            ds = MalimgDataset(config.DATA_DIR, split)
-            labels_in_split = set(ds.get_labels())
-            assert len(labels_in_split) == 25, \
-                f"Split '{split}' missing classes: {25 - len(labels_in_split)} absent"
+# Verify no breakage of Phase 2 imports
+python -c "
+from modules.dataset.loader import get_dataloaders
+print('Phase 2 imports still OK')
+"
 ```
 
 ---
 
-## Definition of Done
+## WHAT NOT TO IMPLEMENT IN THIS PHASE
 
-Run these commands after implementing. All must pass before Phase 2 is complete.
-
-```bash
-# Unit tests only (no dataset required — these must all pass clean)
-pytest tests/test_dataset.py -v -m "not integration"
-
-# Expected output (all unit tests):
-# tests/test_dataset.py::TestNormalizeImage::test_output_range PASSED
-# tests/test_dataset.py::TestNormalizeImage::test_output_dtype_float32 PASSED
-# tests/test_dataset.py::TestNormalizeImage::test_zero_maps_to_zero PASSED
-# tests/test_dataset.py::TestNormalizeImage::test_255_maps_to_one PASSED
-# tests/test_dataset.py::TestNormalizeImage::test_shape_preserved PASSED
-# tests/test_dataset.py::TestNormalizeImage::test_midpoint_maps_correctly PASSED
-# tests/test_dataset.py::TestEncodeLabels::test_sorted_alphabetically PASSED
-# tests/test_dataset.py::TestEncodeLabels::test_unique_integers PASSED
-# tests/test_dataset.py::TestEncodeLabels::test_range_correct PASSED
-# tests/test_dataset.py::TestEncodeLabels::test_deterministic PASSED
-# tests/test_dataset.py::TestEncodeLabels::test_single_family PASSED
-# tests/test_dataset.py::TestEncodeLabels::test_order_independent PASSED
-# tests/test_dataset.py::TestEncodeLabels::test_returns_dict PASSED
-# tests/test_dataset.py::TestEncodeLabels::test_all_values_are_ints PASSED
-# tests/test_dataset.py::TestSaveLoadClassNames::test_roundtrip PASSED
-# tests/test_dataset.py::TestSaveLoadClassNames::test_creates_parent_dirs PASSED
-# tests/test_dataset.py::TestSaveLoadClassNames::test_load_nonexistent_raises PASSED
-# tests/test_dataset.py::TestSaveLoadClassNames::test_file_format_correct PASSED
-# tests/test_dataset.py::TestSaveLoadClassNames::test_overwrites_existing PASSED
-# tests/test_dataset.py::TestValidateDatasetIntegrity::test_missing_dir_raises PASSED
-# tests/test_dataset.py::TestValidateDatasetIntegrity::test_empty_dir_raises PASSED
-# tests/test_dataset.py::TestValidateDatasetIntegrity::test_returns_required_keys PASSED
-# tests/test_dataset.py::TestValidateDatasetIntegrity::test_counts_and_total_correct PASSED
-# tests/test_dataset.py::TestValidateDatasetIntegrity::test_corrupt_file_detection PASSED
-# tests/test_dataset.py::TestValidateDatasetIntegrity::test_families_sorted PASSED
-# tests/test_dataset.py::TestValidateDatasetIntegrity::test_imbalance_ratio PASSED
-# tests/test_dataset.py::TestValidateDatasetIntegrity::test_missing_dirs_always_empty_list PASSED
-# tests/test_dataset.py::TestMalimgDataset::test_invalid_split_raises PASSED
-# tests/test_dataset.py::TestMalimgDataset::test_missing_data_dir_raises PASSED
-# tests/test_dataset.py::TestMalimgDataset::test_split_sizes_sum_to_total PASSED
-# tests/test_dataset.py::TestMalimgDataset::test_getitem_tensor_shape PASSED
-# tests/test_dataset.py::TestMalimgDataset::test_getitem_tensor_dtype PASSED
-# tests/test_dataset.py::TestMalimgDataset::test_getitem_label_is_int PASSED
-# tests/test_dataset.py::TestMalimgDataset::test_class_names_sorted PASSED
-# tests/test_dataset.py::TestMalimgDataset::test_label_map_keys_match_class_names PASSED
-# tests/test_dataset.py::TestMalimgDataset::test_label_map_values_are_unique_ints PASSED
-# tests/test_dataset.py::TestMalimgDataset::test_get_labels_length_matches_len PASSED
-# tests/test_dataset.py::TestMalimgDataset::test_splits_are_reproducible PASSED
-# tests/test_dataset.py::TestMalimgDataset::test_different_seeds_produce_different_splits PASSED
-#
-# ====== X passed, 3 deselected (integration) ======
-
-# Phase 1 tests must still pass (no regressions)
-pytest tests/test_converter.py -v
-```
-
-If you have the Malimg dataset available:
-```bash
-# Run all tests including integration
-pytest tests/test_dataset.py -v
-```
-
-### Checklist
-
-- [ ] `pytest tests/test_dataset.py -v -m "not integration"` passes with zero failures
-- [ ] `pytest tests/test_converter.py -v` still passes (no regressions)
-- [ ] `modules/dataset/__init__.py` exports `MalimgDataset`, `get_dataloaders`, `validate_dataset_integrity`
-- [ ] `modules/enhancement/__init__.py` exports `get_train_transforms`, `get_val_transforms`, `GaussianNoise`, `ClassAwareOversampler`
-- [ ] `cv2.imread()` uses `cv2.IMREAD_GRAYSCALE` everywhere — never loads as BGR
-- [ ] `cv2.resize()` uses `(img_size, img_size)` — NOT `(height, width)` or `(width, height)` reversed
-- [ ] `Normalize` uses `mean=[0.5], std=[0.5]` (single-element lists, not scalars)
-- [ ] `ColorJitter` is before `ToTensor()` in the train pipeline
-- [ ] `GaussianNoise` is after `ToTensor()` in the train pipeline
-- [ ] `encode_labels()` sorts alphabetically before enumerating
-- [ ] `train_test_split` uses `random_state=config.RANDOM_SEED`
-- [ ] No external network calls anywhere in these modules
-
----
-
-## Common Bugs to Avoid
-
-| Bug | Symptom | Fix |
-|-----|---------|-----|
-| `cv2.resize((height, width))` | Images load with transposed dimensions | Use `(width, height)` — i.e. `(img_size, img_size)` for square |
-| `Normalize(mean=0.5, std=0.5)` scalar | Runtime error or wrong normalization | Must be `mean=[0.5], std=[0.5]` (lists) |
-| `ColorJitter` after `ToTensor` | TypeError: expects PIL Image | Move `ColorJitter` before `ToTensor` |
-| `GaussianNoise` before `ToTensor` | TypeError: tensor expected | Move `GaussianNoise` after `ToTensor` |
-| Forgetting `sorted()` in `encode_labels` | Non-deterministic label mapping | Always sort before enumerating |
-| `shuffle=True` on val/test loader | Non-reproducible evaluation | Only train loader uses sampler; val/test use `shuffle=False` |
-| `sampler=` AND `shuffle=True` together | DataLoader raises ValueError | Use either `sampler=` or `shuffle=True`, never both |
-| Forgetting `drop_last=True` on train loader | Single-sample final batch crashes BatchNorm | Set `drop_last=True` on train DataLoader only |
-| `WeightedRandomSampler(replacement=False)` | Cannot oversample minority classes | Must use `replacement=True` |
-
----
-
-*Phase 2 complete → proceed to Phase 3: Enhancement tests + Detection model.*
+- `modules/detection/` — Phase 4
+- `modules/dashboard/` — Phase 6
+- `scripts/train.py` — Phase 5
+- Any changes to `modules/dataset/` beyond fixing a broken import for this module
+- Any changes to `modules/binary_to_image/`
