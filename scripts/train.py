@@ -38,7 +38,6 @@ from pathlib import Path
 
 
 def parse_args() -> argparse.Namespace:
-    import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     import config
     parser = argparse.ArgumentParser(
