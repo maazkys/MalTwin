@@ -1,9 +1,6 @@
 # modules/enhancement/augmentor.py
-import random
 import torch
-import numpy as np
 from torchvision import transforms
-from PIL import Image
 
 
 class GaussianNoise:
@@ -19,7 +16,7 @@ class GaussianNoise:
                            Default (0.01, 0.05).
 
     __call__:
-        1. Sample std = random.uniform(std_range[0], std_range[1])
+        1. Sample std = torch.empty(1).uniform_(std_range[0], std_range[1]).item()
         2. Generate noise = torch.randn_like(tensor) * std + mean
         3. result = tensor + noise
         4. Clamp result to [0.0, 1.0]
@@ -31,7 +28,7 @@ class GaussianNoise:
         self.std_range = std_range
 
     def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
-        std = random.uniform(self.std_range[0], self.std_range[1])
+        std = torch.empty(1).uniform_(self.std_range[0], self.std_range[1]).item()
         noise = torch.randn_like(tensor) * std + self.mean
         return torch.clamp(tensor + noise, 0.0, 1.0)
 
@@ -44,7 +41,7 @@ def get_train_transforms(img_size: int = 128) -> transforms.Compose:
     Build the augmentation pipeline for training data.
 
     Transform order (CRITICAL — do not reorder):
-        1. RandomRotation(degrees=15, fill=0)      ← PIL stage
+        1. RandomRotation(degrees=15, fill=0, interpolation=BILINEAR) ← PIL stage
         2. RandomHorizontalFlip(p=0.5)             ← PIL stage
         3. RandomVerticalFlip(p=0.5)               ← PIL stage
         4. ColorJitter(brightness=0.2)             ← PIL stage (MUST be before ToTensor)
@@ -59,7 +56,11 @@ def get_train_transforms(img_size: int = 128) -> transforms.Compose:
         transforms.Compose instance
     """
     return transforms.Compose([
-        transforms.RandomRotation(degrees=15, fill=0),
+        transforms.RandomRotation(
+            degrees=15,
+            fill=0,
+            interpolation=transforms.InterpolationMode.BILINEAR,
+        ),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomVerticalFlip(p=0.5),
         transforms.ColorJitter(brightness=0.2),    # PIL stage — before ToTensor

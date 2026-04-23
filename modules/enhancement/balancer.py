@@ -29,6 +29,12 @@ class ClassAwareOversampler:
     """
 
     def __init__(self, dataset, strategy: str = 'oversample_minority'):
+        valid = {"oversample_minority", "sqrt_inverse", "uniform"}
+        if strategy not in valid:
+            raise ValueError(
+                f"Unknown oversampling strategy: '{strategy}'. "
+                f"Must be one of: oversample_minority, sqrt_inverse, uniform"
+            )
         self.dataset = dataset
         self.strategy = strategy
         self.class_weights: dict[int, float] = {}
@@ -63,9 +69,11 @@ class ClassAwareOversampler:
             dtype=torch.float32,
         )
 
-        return WeightedRandomSampler(
+        sampler = WeightedRandomSampler(
             weights=sample_weights,
             num_samples=len(labels),
             replacement=True,
         )
+        sampler.weights = sample_weights  # expose float32 weights for external inspection
+        return sampler
 
