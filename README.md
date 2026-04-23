@@ -1,1079 +1,1203 @@
-# MalTwin — Phase 3 Implementation
-### Data Enhancement & Balancing Module
-### Agent Instruction Document
+# MalTwin — Phase 4: Detection Module
+### Agent Instruction Document | `modules/detection/` + `tests/test_model.py`
+
+> **Read this entire document before writing a single line of code.**
+> Every class, method, signature, and behavioral rule is fully specified.
+> Do not infer, guess, or deviate from what is written here.
 
 ---
 
-## YOUR TASK
+## Mandatory Rules (from PRD Section 16)
 
-Implement Phase 3 of the MalTwin project: the data augmentation and class balancing pipeline.
+These are the most commonly hallucinated bugs. Violating any of them causes test failures or silent training errors.
 
-This phase builds on top of Phase 1 (binary_to_image) and Phase 2 (dataset).
-It has no new external dependencies beyond what is already in `requirements.txt`.
-
-At the end of this phase the following must be true:
-- `pytest tests/test_enhancement.py -v` passes with **zero failures**
-- `get_train_transforms` and `get_val_transforms` produce correctly shaped tensors
-- `ClassAwareOversampler` produces a valid `WeightedRandomSampler`
-- All augmentation transforms apply in the correct order (PIL stage before tensor stage)
+- **Read `MALTWIN_PRD_COMPLETE.md`** before writing any code.
+- All CNN tensors are **single-channel**: shape `(batch, 1, H, W)`. NEVER `(batch, 3, H, W)`.
+- `CrossEntropyLoss` expects **raw logits** — do NOT apply softmax inside `model.forward()`.
+- `model.eval()` and `torch.no_grad()` are **always paired** during inference and validation.
+- `torch.manual_seed(42)` is called at the **start of `train()`**, not at module level.
+- Use `weights_only=True` in `torch.load()` for PyTorch 2.x security.
+- `bias=False` in Conv2d when followed by BatchNorm (eliminates redundant parameters).
+- `drop_last=True` in train DataLoader to prevent single-sample batches breaking BatchNorm.
+- `self.gradcam_layer = self.block3.conv2` **must be set** in `MalTwinCNN.__init__`.
+  Agents forget this constantly even when it is in the spec. The test will catch it.
+- `matplotlib.use('Agg')` must be at the **module level** of `evaluator.py` (before any plt calls).
+- `plt.close(fig)` is **mandatory** after saving — prevents memory leaks.
+- `get_val_transforms` is used inside `predict_single` — NEVER `get_train_transforms`.
+- All paths use `pathlib.Path`, never string concatenation.
 
 ---
 
-## CONTEXT: WHERE THIS FITS
+## Phase 4 Scope
 
-```
-Phase 1 — binary_to_image/   ✅ DONE
-Phase 2 — dataset/            ✅ DONE
-Phase 3 — enhancement/        ← YOU ARE HERE
-Phase 4 — detection/          (next)
-Phase 5 — scripts/train.py    (after phase 4)
-Phase 6 — dashboard/          (after phase 5)
-```
+Phase 4 implements the full detection module: model architecture, training loop, evaluation, and inference. It depends on Phases 1–3 (binary_to_image, dataset, enhancement must already exist).
 
-Phase 3 outputs are consumed by Phase 2's `get_dataloaders()` function.
-Specifically, `modules/dataset/loader.py` imports:
+### Files to create
+
+| File | Description |
+|------|-------------|
+| `modules/detection/__init__.py` | Package exports |
+| `modules/detection/model.py` | `ConvBlock`, `MalTwinCNN` |
+| `modules/detection/trainer.py` | `train()`, `validate_epoch()` |
+| `modules/detection/evaluator.py` | `evaluate()`, `plot_confusion_matrix()`, `format_metrics_table()` |
+| `modules/detection/inference.py` | `load_model()`, `predict_single()`, `predict_batch()` |
+| `tests/test_model.py` | Full test suite (exactly as specified below) |
+
+---
+
+## File 1: `modules/detection/__init__.py`
 
 ```python
-from modules.enhancement.augmentor import get_train_transforms, get_val_transforms
-from modules.enhancement.balancer import ClassAwareOversampler
+# modules/detection/__init__.py
+from .model import MalTwinCNN
+from .trainer import train
+from .evaluator import evaluate
+from .inference import load_model, predict_single
 ```
-
-These imports already exist in the Phase 2 code. If they are currently commented
-out or raising ImportError, this phase fixes that.
 
 ---
 
-## FILES TO CREATE
-
-```
-modules/enhancement/__init__.py
-modules/enhancement/augmentor.py
-modules/enhancement/balancer.py
-tests/test_enhancement.py
-```
-
-Do not modify any existing files unless fixing a broken import in
-`modules/dataset/loader.py` that references these modules.
-
----
-
-## MANDATORY RULES — READ BEFORE WRITING ANY CODE
-
-1. **Transform ordering is critical and non-negotiable:**
-   - `RandomRotation`, `RandomHorizontalFlip`, `RandomVerticalFlip`, `ColorJitter`
-     operate on **PIL Images** and MUST come BEFORE `transforms.ToTensor()`.
-   - `GaussianNoise` operates on **torch.Tensor** and MUST come AFTER `transforms.ToTensor()`.
-   - `transforms.Normalize` MUST be the last transform in both pipelines.
-   - Getting this order wrong silently produces wrong results — the tests verify it.
-
-2. **Single-channel normalisation only.**
-   `transforms.Normalize(mean=[0.5], std=[0.5])` uses single-element lists.
-   Never use 3-element lists. Never use scalar values. Always `[0.5]` not `0.5`.
-
-3. **`GaussianNoise` clamps output to `[0.0, 1.0]`** after adding noise.
-   This is mandatory. Unclamped noise produces values outside the normalisation
-   assumption and breaks the model.
-
-4. **`WeightedRandomSampler` uses `replacement=True`.**
-   Without this, oversampling minority classes is impossible.
-
-5. **All random ops in transforms use PyTorch/torchvision internals.**
-   Do not use `random.random()` or `np.random` inside `GaussianNoise.__call__`.
-   Use `torch.randn_like()` for noise generation.
-   Use `torch.empty(1).uniform_(low, high).item()` for sampling std.
-
-6. **`get_val_transforms` is ALWAYS deterministic.**
-   It must contain ONLY `ToTensor` and `Normalize`. No randomness whatsoever.
-   Tests verify this explicitly.
-
-7. **Both transform pipelines accept a PIL Image in mode `'L'` as input.**
-   The dataset loader calls `transform(pil_img)` where `pil_img` is a grayscale
-   PIL Image. The first transform in each pipeline must be compatible with
-   PIL Image input.
-
-8. **`ClassAwareOversampler.get_sampler()` must set `self.class_weights`**
-   as an instance attribute so tests can inspect computed weights.
-
----
-
-## FILE 1: `modules/enhancement/augmentor.py`
+## File 2: `modules/detection/model.py`
 
 ```python
-"""
-Augmentation transform pipelines for MalTwin.
+# modules/detection/model.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-Training pipeline:  RandomRotation → RandomHFlip → RandomVFlip → ColorJitter
-                    → ToTensor → GaussianNoise → Normalize
-Validation pipeline: ToTensor → Normalize
 
-Both pipelines accept PIL Image mode 'L' (grayscale) as input.
-Both pipelines output torch.Tensor of shape (1, H, W), dtype float32, range [-1, 1].
+class ConvBlock(nn.Module):
+    """
+    Reusable convolutional block:
+        Conv2d → BatchNorm → ReLU → Conv2d → BatchNorm → ReLU → MaxPool2d → Dropout2d
 
-SRS refs: Module 4 FE-1, FE-2
-"""
+    Constructor args:
+        in_channels  (int):   input channels
+        out_channels (int):   output channels for BOTH Conv layers
+        dropout_p    (float): Dropout2d probability, default 0.25
+
+    bias=False in all Conv2d because BatchNorm follows immediately.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, dropout_p: float = 0.25):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.bn1   = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.bn2   = nn.BatchNorm2d(out_channels)
+        self.pool  = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.drop  = nn.Dropout2d(p=dropout_p)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = self.pool(x)
+        x = self.drop(x)
+        return x
+
+
+class MalTwinCNN(nn.Module):
+    """
+    Three-block CNN for grayscale malware image classification.
+
+    Input:  (batch_size, 1, 128, 128)  — single-channel grayscale
+    Output: (batch_size, num_classes)  — raw logits (NO softmax)
+
+    Architecture:
+        Input (1, 128, 128)
+            ↓
+        block1: ConvBlock(1 → 32)      → (32, 64, 64)   after MaxPool
+            ↓
+        block2: ConvBlock(32 → 64)     → (64, 32, 32)   after MaxPool
+            ↓
+        block3: ConvBlock(64 → 128)    → (128, 16, 16)  after MaxPool
+            ↓                            ← self.gradcam_layer = self.block3.conv2
+        pool:   AdaptiveAvgPool2d(4,4) → (128, 4, 4)
+            ↓
+        flatten                        → (2048,)
+            ↓
+        classifier:
+            Linear(2048 → 512)
+            ReLU
+            Dropout(p=0.5)
+            Linear(512 → num_classes)
+            ↓
+        raw logits (num_classes,)
+
+    CRITICAL:
+        self.gradcam_layer = self.block3.conv2
+        This MUST be set — it is tested explicitly.
+        It is used by Module 7 (Grad-CAM) to register backward hooks.
+    """
+
+    def __init__(self, num_classes: int):
+        super().__init__()
+        self.block1 = ConvBlock(1, 32)
+        self.block2 = ConvBlock(32, 64)
+        self.block3 = ConvBlock(64, 128)
+        self.pool   = nn.AdaptiveAvgPool2d((4, 4))
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128 * 4 * 4, 512),
+            nn.ReLU(),
+            nn.Dropout(p=0.5),
+            nn.Linear(512, num_classes),
+        )
+
+        # Grad-CAM hook target — MUST be the second conv of block3
+        self.gradcam_layer = self.block3.conv2
+
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        """
+        Kaiming normal for Conv2d, constant init for BatchNorm, Xavier for Linear.
+        """
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.pool(x)
+        x = torch.flatten(x, 1)
+        x = self.classifier(x)
+        return x  # raw logits — NO softmax here
+```
+
+---
+
+## File 3: `modules/detection/trainer.py`
+
+```python
+# modules/detection/trainer.py
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from pathlib import Path
+from tqdm import tqdm
+import config
+from .model import MalTwinCNN
+
+
+def train(
+    model: MalTwinCNN,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    device: torch.device,
+    epochs: int = config.EPOCHS,
+    lr: float = config.LR,
+    weight_decay: float = config.WEIGHT_DECAY,
+    lr_patience: int = config.LR_PATIENCE,
+    checkpoint_dir: Path = config.CHECKPOINT_DIR,
+    best_model_path: Path = config.BEST_MODEL_PATH,
+) -> dict:
+    """
+    Full training loop with per-epoch checkpointing and LR scheduling.
+
+    Returns history dict:
+        {
+            'train_loss':   list[float],   # mean loss per epoch
+            'train_acc':    list[float],   # accuracy 0.0–1.0 per epoch
+            'val_loss':     list[float],
+            'val_acc':      list[float],
+            'best_val_acc': float,
+            'best_epoch':   int,
+        }
+
+    Optimizer:   Adam(lr=lr, weight_decay=weight_decay)
+    Loss:        CrossEntropyLoss() — expects raw logits, no softmax in model
+    Scheduler:   ReduceLROnPlateau(mode='max', factor=0.5, patience=lr_patience, min_lr=1e-6)
+                 scheduler.step(val_acc) called after each epoch.
+
+    Per-epoch:
+        1. model.train()
+        2. Iterate train_loader with tqdm (desc="Epoch NNN/NNN [Train]")
+        3. Forward → loss → backward → optimizer.step()
+        4. Accumulate correct predictions for accuracy
+        5. validate_epoch() → val_loss, val_acc
+        6. scheduler.step(val_acc)
+        7. Print epoch summary
+        8. Save checkpoint: checkpoint_dir/epoch_{N:03d}_acc{val_acc:.4f}.pt
+        9. If val_acc > best so far: save model.state_dict() to best_model_path
+
+    Reproducibility:
+        torch.manual_seed(config.RANDOM_SEED) at top of function.
+        torch.cuda.manual_seed(config.RANDOM_SEED) if CUDA.
+    """
+    # Reproducibility — seed at start of train(), not at module level
+    torch.manual_seed(config.RANDOM_SEED)
+    if device.type == 'cuda':
+        torch.cuda.manual_seed(config.RANDOM_SEED)
+
+    model = model.to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='max',
+        factor=0.5,
+        patience=lr_patience,
+        min_lr=1e-6,
+        verbose=True,
+    )
+
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    history = {
+        'train_loss':   [],
+        'train_acc':    [],
+        'val_loss':     [],
+        'val_acc':      [],
+        'best_val_acc': 0.0,
+        'best_epoch':   0,
+    }
+    best_val_acc = 0.0
+
+    for epoch in range(epochs):
+        # ── Training phase ──────────────────────────────────────────────────────
+        model.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+
+        pbar = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch+1:03d}/{epochs:03d} [Train]",
+            leave=False,
+        )
+        for inputs, labels in pbar:
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            batch_size = inputs.size(0)
+            running_loss += loss.item() * batch_size
+            _, predicted = outputs.max(1)
+            correct += predicted.eq(labels).sum().item()
+            total += batch_size
+
+            pbar.set_postfix({'loss': f"{running_loss/total:.4f}", 'acc': f"{correct/total:.4f}"})
+
+        train_loss = running_loss / total
+        train_acc  = correct / total
+
+        # ── Validation phase ─────────────────────────────────────────────────────
+        val_loss, val_acc = validate_epoch(model, val_loader, device, criterion)
+
+        # ── Scheduler step ───────────────────────────────────────────────────────
+        scheduler.step(val_acc)
+
+        # ── Logging ──────────────────────────────────────────────────────────────
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['val_loss'].append(val_loss)
+        history['val_acc'].append(val_acc)
+
+        current_lr = optimizer.param_groups[0]['lr']
+        print(
+            f"Epoch {epoch+1:03d}/{epochs} | "
+            f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
+            f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | "
+            f"LR: {current_lr:.6f}"
+        )
+
+        # ── Checkpoint ────────────────────────────────────────────────────────────
+        checkpoint_path = checkpoint_dir / f"epoch_{epoch+1:03d}_acc{val_acc:.4f}.pt"
+        torch.save({
+            'epoch':           epoch + 1,
+            'model_state':     model.state_dict(),
+            'optimizer_state': optimizer.state_dict(),
+            'val_acc':         val_acc,
+            'val_loss':        val_loss,
+            'train_acc':       train_acc,
+            'train_loss':      train_loss,
+        }, checkpoint_path)
+
+        # ── Best model save ───────────────────────────────────────────────────────
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            history['best_val_acc'] = best_val_acc
+            history['best_epoch']   = epoch + 1
+            torch.save(model.state_dict(), best_model_path)
+            print(f"  ★ New best model saved (val_acc={val_acc:.4f})")
+
+    return history
+
+
+def validate_epoch(
+    model: MalTwinCNN,
+    loader: DataLoader,
+    device: torch.device,
+    criterion: nn.Module,
+) -> tuple[float, float]:
+    """
+    Run one full validation pass. Returns (avg_loss, accuracy).
+
+    model.eval() and torch.no_grad() are always used together here.
+    Loss is accumulated weighted by batch size for correctness with variable batch sizes.
+    """
+    model.eval()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for inputs, labels in loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            # Multiply by batch size for correct mean across variable-size final batch
+            total_loss += loss.item() * inputs.size(0)
+            _, predicted = outputs.max(1)
+            correct += predicted.eq(labels).sum().item()
+            total += labels.size(0)
+
+    return total_loss / total, correct / total
+```
+
+---
+
+## File 4: `modules/detection/evaluator.py`
+
+```python
+# modules/detection/evaluator.py
 import torch
 import numpy as np
-from torchvision import transforms
+import matplotlib
+matplotlib.use('Agg')   # MUST be at module level — no display required in server env
+import matplotlib.pyplot as plt
+from pathlib import Path
+from sklearn.metrics import (
+    accuracy_score,
+    precision_recall_fscore_support,
+    confusion_matrix,
+    classification_report,
+)
+from torch.utils.data import DataLoader
+import config
+from .model import MalTwinCNN
 
 
-class GaussianNoise:
+def evaluate(
+    model: MalTwinCNN,
+    test_loader: DataLoader,
+    device: torch.device,
+    class_names: list[str],
+) -> dict:
     """
-    Custom torchvision-compatible transform that injects Gaussian noise into a tensor.
-
-    MUST be placed AFTER transforms.ToTensor() in the pipeline.
-    Operates on torch.Tensor, NOT PIL Image.
-
-    Constructor args:
-        mean (float):      noise mean. Default 0.0.
-        std_range (tuple): (min_std, max_std). std is sampled uniformly in this
-                           range on every __call__. Default (0.01, 0.05).
-
-    __call__(tensor: torch.Tensor) -> torch.Tensor:
-        Steps (implement in this exact order):
-            1. Sample std from uniform distribution over std_range:
-                   std = torch.empty(1).uniform_(std_range[0], std_range[1]).item()
-            2. Generate noise tensor with same shape and device as input:
-                   noise = torch.randn_like(tensor) * std + mean
-            3. Add noise to input:
-                   noisy = tensor + noise
-            4. Clamp to valid range:
-                   result = torch.clamp(noisy, 0.0, 1.0)
-            5. Return result (same shape and dtype as input tensor)
-
-    __repr__:
-        return f"GaussianNoise(mean={self.mean}, std_range={self.std_range})"
-
-    Notes:
-        - torch.randn_like preserves device and dtype of input tensor.
-        - torch.clamp is mandatory. Tests verify output is strictly in [0.0, 1.0].
-        - Do NOT use random.uniform or np.random here.
-        - This simulates minor binary perturbations (SRS Module 4 FE-2).
-    """
-
-    def __init__(self, mean: float = 0.0, std_range: tuple = (0.01, 0.05)) -> None:
-        self.mean = mean
-        self.std_range = std_range
-
-    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
-        # implement here
-        ...
-
-    def __repr__(self) -> str:
-        return f"GaussianNoise(mean={self.mean}, std_range={self.std_range})"
-
-
-def get_train_transforms(img_size: int = 128) -> transforms.Compose:
-    """
-    Build the augmentation pipeline for TRAINING data only.
-
-    Args:
-        img_size (int): kept for API consistency with get_val_transforms.
-                        Not used internally — resizing is done in the Dataset.
+    Full evaluation on test set. Returns comprehensive metrics dict.
 
     Returns:
-        transforms.Compose instance with the following stages IN THIS EXACT ORDER:
+        {
+            'accuracy':              float,
+            'precision_macro':       float,
+            'recall_macro':          float,
+            'f1_macro':              float,
+            'precision_weighted':    float,
+            'recall_weighted':       float,
+            'f1_weighted':           float,
+            'confusion_matrix':      np.ndarray,   # shape (num_classes, num_classes)
+            'per_class': {
+                family_name: {
+                    'precision': float,
+                    'recall':    float,
+                    'f1':        float,
+                    'support':   int,
+                }
+            },
+            'classification_report': str,
+            'num_test_samples':      int,
+        }
 
-        Stage 1 — PIL stage (input must be PIL Image mode 'L'):
-            transforms.RandomRotation(
-                degrees=15,
-                fill=0,
-                interpolation=transforms.InterpolationMode.BILINEAR,
+    Implementation:
+        1. model.eval()
+        2. Collect all predictions and true labels with torch.no_grad()
+        3. Compute all metrics using sklearn
+        4. Build per_class dict from precision_recall_fscore_support(average=None)
+    """
+    model.eval()
+    all_preds  = []
+    all_labels = []
+
+    with torch.no_grad():
+        for inputs, labels in test_loader:
+            inputs = inputs.to(device)
+            outputs = model(inputs)
+            preds = outputs.argmax(dim=1).cpu().numpy()
+            all_preds.extend(preds.tolist())
+            all_labels.extend(labels.numpy().tolist())
+
+    num_classes = len(class_names)
+
+    # Overall metrics
+    accuracy = accuracy_score(all_labels, all_preds)
+
+    prec_macro, rec_macro, f1_macro, _ = precision_recall_fscore_support(
+        all_labels, all_preds, average='macro', zero_division=0
+    )
+    prec_weighted, rec_weighted, f1_weighted, _ = precision_recall_fscore_support(
+        all_labels, all_preds, average='weighted', zero_division=0
+    )
+
+    # Per-class metrics
+    prec_per, rec_per, f1_per, support_per = precision_recall_fscore_support(
+        all_labels, all_preds, average=None,
+        labels=list(range(num_classes)), zero_division=0
+    )
+    per_class = {
+        class_names[i]: {
+            'precision': float(prec_per[i]),
+            'recall':    float(rec_per[i]),
+            'f1':        float(f1_per[i]),
+            'support':   int(support_per[i]),
+        }
+        for i in range(num_classes)
+    }
+
+    # Confusion matrix
+    cm = confusion_matrix(all_labels, all_preds, labels=list(range(num_classes)))
+
+    # Full classification report string
+    report = classification_report(
+        all_labels, all_preds,
+        target_names=class_names,
+        zero_division=0,
+    )
+
+    return {
+        'accuracy':              float(accuracy),
+        'precision_macro':       float(prec_macro),
+        'recall_macro':          float(rec_macro),
+        'f1_macro':              float(f1_macro),
+        'precision_weighted':    float(prec_weighted),
+        'recall_weighted':       float(rec_weighted),
+        'f1_weighted':           float(f1_weighted),
+        'confusion_matrix':      cm,
+        'per_class':             per_class,
+        'classification_report': report,
+        'num_test_samples':      len(all_labels),
+    }
+
+
+def plot_confusion_matrix(
+    cm: np.ndarray,
+    class_names: list[str],
+    output_path: Path,
+    figsize: tuple = (16, 14),
+) -> None:
+    """
+    Render and save confusion matrix as PNG.
+
+    matplotlib.use('Agg') is set at module level — never call plt.show().
+    plt.close(fig) is mandatory — prevents memory leaks in long training runs.
+    """
+    fig, ax = plt.subplots(figsize=figsize)
+    im = ax.imshow(cm, interpolation='nearest', cmap='Blues')
+    plt.colorbar(im, ax=ax)
+
+    tick_marks = np.arange(len(class_names))
+    ax.set_xticks(tick_marks)
+    ax.set_xticklabels(class_names, rotation=90, fontsize=8)
+    ax.set_yticks(tick_marks)
+    ax.set_yticklabels(class_names, fontsize=8)
+
+    # Cell annotations
+    thresh = cm.max() / 2.0
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(
+                j, i, str(cm[i, j]),
+                ha='center', va='center',
+                color='white' if cm[i, j] > thresh else 'black',
+                fontsize=6,
             )
-            Rotates by angle sampled from [-15, 15] degrees.
-            fill=0 means out-of-bounds pixels become black (correct for binary images).
-            SRS ref: Module 4 FE-1
 
-            transforms.RandomHorizontalFlip(p=0.5)
-            50% chance of horizontal flip.
-            SRS ref: Module 4 FE-1
+    ax.set_ylabel('True Label', fontsize=12)
+    ax.set_xlabel('Predicted Label', fontsize=12)
+    ax.set_title('MalTwin Confusion Matrix', fontsize=14, pad=20)
+    plt.tight_layout()
+    plt.savefig(str(output_path), dpi=150, bbox_inches='tight')
+    plt.close(fig)  # MANDATORY — prevent memory leak
 
-            transforms.RandomVerticalFlip(p=0.5)
-            50% chance of vertical flip.
-            SRS ref: Module 4 FE-1
 
-            transforms.ColorJitter(brightness=0.2)
-            Randomly adjusts brightness by factor in [0.8, 1.2].
-            Works on PIL Image — must be BEFORE ToTensor.
-            SRS ref: Module 4 FE-1
-
-        Stage 2 — Conversion:
-            transforms.ToTensor()
-            Converts PIL Image mode 'L' to tensor shape (1, H, W), values [0.0, 1.0].
-            This is the PIL→tensor boundary. Everything before is PIL. Everything after is tensor.
-
-        Stage 3 — Tensor stage (input must be torch.Tensor):
-            GaussianNoise(mean=0.0, std_range=(0.01, 0.05))
-            Applied AFTER ToTensor. Adds noise, clamps to [0.0, 1.0].
-            SRS ref: Module 4 FE-2
-
-            transforms.Normalize(mean=[0.5], std=[0.5])
-            Maps [0.0, 1.0] → [-1.0, 1.0].
-            Single-element lists. MUST be last.
-
-    CRITICAL: The order above is non-negotiable. Any reordering will break the pipeline.
+def format_metrics_table(metrics: dict, class_names: list[str]) -> str:
     """
-    return transforms.Compose([
-        # Stage 1 — PIL transforms
-        transforms.RandomRotation(
-            degrees=15,
-            fill=0,
-            interpolation=transforms.InterpolationMode.BILINEAR,
-        ),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomVerticalFlip(p=0.5),
-        transforms.ColorJitter(brightness=0.2),
-        # Stage 2 — Conversion
-        transforms.ToTensor(),
-        # Stage 3 — Tensor transforms
-        GaussianNoise(mean=0.0, std_range=(0.01, 0.05)),
-        transforms.Normalize(mean=[0.5], std=[0.5]),
-    ])
+    Format evaluation metrics as a printable ASCII table for CLI output.
 
-
-def get_val_transforms(img_size: int = 128) -> transforms.Compose:
+    Includes overall metrics and the 5 worst per-class F1 scores.
     """
-    Build the inference/validation transform pipeline.
-    NO augmentation. Fully deterministic.
+    width = 44
 
-    Args:
-        img_size (int): kept for API consistency. Not used internally.
+    def row(label: str, value) -> str:
+        if isinstance(value, float):
+            return f"║  {label:<22} {value:.4f}          ║"
+        return f"║  {label:<22} {value:<14}║"
 
-    Returns:
-        transforms.Compose with exactly two stages:
+    border_top    = '╔' + '═' * width + '╗'
+    border_mid    = '╠' + '═' * width + '╣'
+    border_bot    = '╚' + '═' * width + '╝'
+    title_line    = f"║{'MALTWIN TEST EVALUATION':^{width}}║"
 
-            transforms.ToTensor()
-            Converts PIL Image mode 'L' to tensor (1, H, W), values [0.0, 1.0].
+    lines = [
+        border_top,
+        title_line,
+        border_mid,
+        row('Accuracy:', metrics['accuracy']),
+        row('Precision (macro):', metrics['precision_macro']),
+        row('Recall (macro):', metrics['recall_macro']),
+        row('F1 (macro):', metrics['f1_macro']),
+        row('F1 (weighted):', metrics['f1_weighted']),
+        row('Test Samples:', metrics['num_test_samples']),
+        border_mid,
+        f"║{'Per-Class F1 (5 worst):':^{width}}║",
+    ]
 
-            transforms.Normalize(mean=[0.5], std=[0.5])
-            Maps [0.0, 1.0] → [-1.0, 1.0].
-            Single-element lists.
+    # Sort by F1 ascending to find worst
+    per_class = metrics.get('per_class', {})
+    worst5 = sorted(per_class.items(), key=lambda kv: kv[1]['f1'])[:5]
+    for name, vals in worst5:
+        short_name = name[:20] if len(name) > 20 else name
+        lines.append(f"║    {short_name:<20} {vals['f1']:.4f}          ║")
 
-    USED FOR: validation set, test set, and all dashboard inference.
-    NEVER used for training.
-    """
-    return transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5], std=[0.5]),
-    ])
+    lines.append(border_bot)
+    return '\n'.join(lines)
 ```
 
 ---
 
-## FILE 2: `modules/enhancement/balancer.py`
+## File 5: `modules/detection/inference.py`
 
 ```python
-"""
-Class-aware oversampling for the Malimg dataset.
-
-Malimg is severely class-imbalanced:
-    Allaple.A  → 2949 samples  (most)
-    Skintrim.N → 80   samples  (fewest)
-    Ratio      → ~37x imbalance
-
-Without balancing the CNN learns to predict majority classes and ignores rare families.
-WeightedRandomSampler gives each class equal expected representation per epoch.
-
-SRS ref: Module 4 FE-3
-"""
-import math
-from collections import Counter
-
+# modules/detection/inference.py
 import torch
-from torch.utils.data import WeightedRandomSampler
+import numpy as np
+from pathlib import Path
+from PIL import Image
+import config
+from .model import MalTwinCNN
+from modules.enhancement.augmentor import get_val_transforms
 
 
-class ClassAwareOversampler:
+def load_model(
+    model_path: Path = config.BEST_MODEL_PATH,
+    num_classes: int = config.MALIMG_EXPECTED_FAMILIES,
+    device: torch.device = config.DEVICE,
+) -> MalTwinCNN:
     """
-    Produces a WeightedRandomSampler to address class imbalance.
+    Load a trained MalTwinCNN from a .pt file containing state_dict only.
 
-    Constructor args:
-        dataset:          any object with a get_labels() method that returns list[int].
-                          In practice this is a MalimgDataset training split instance.
-        strategy (str):   one of:
-            'oversample_minority' — weight = 1.0 / class_count
-                                    Minority classes appear as often as majority.
-                                    Best for severe imbalance.
-            'sqrt_inverse'        — weight = 1.0 / sqrt(class_count)
-                                    Softer balancing. Preserves some natural distribution.
-                                    Best for moderate imbalance.
-            'uniform'             — weight = 1.0 for all classes regardless of count.
-                                    Effectively random sampling. Use for ablation.
+    Args:
+        model_path:  path to best_model.pt
+        num_classes: must match the trained model's output layer (25 for Malimg)
+        device:      target device; handles CUDA→CPU migration automatically
+
+    Returns:
+        MalTwinCNN in eval() mode on the specified device.
 
     Raises:
-        ValueError: f"Unknown oversampling strategy: '{strategy}'. "
-                    f"Must be one of: oversample_minority, sqrt_inverse, uniform"
-            if strategy is not one of the three valid values.
-
-    Attributes set after get_sampler() is called:
-        self.class_weights: dict[int, float]
-            Computed weight per integer class label.
-            Set inside get_sampler() before returning.
-
-    get_sampler() -> WeightedRandomSampler:
-        Steps (implement exactly):
-
-            1. Get labels:
-                   labels = self.dataset.get_labels()    # list[int]
-
-            2. Count per class:
-                   class_counts = Counter(labels)        # {class_int: count}
-
-            3. Compute class weights based on strategy:
-                   if strategy == 'oversample_minority':
-                       class_weights = {c: 1.0 / count
-                                        for c, count in class_counts.items()}
-                   elif strategy == 'sqrt_inverse':
-                       class_weights = {c: 1.0 / math.sqrt(count)
-                                        for c, count in class_counts.items()}
-                   elif strategy == 'uniform':
-                       class_weights = {c: 1.0 for c in class_counts}
-
-            4. Assign to instance attribute:
-                   self.class_weights = class_weights
-
-            5. Build per-sample weight tensor:
-                   sample_weights = torch.tensor(
-                       [class_weights[label] for label in labels],
-                       dtype=torch.float32,
-                   )
-
-            6. Return sampler:
-                   return WeightedRandomSampler(
-                       weights=sample_weights,
-                       num_samples=len(labels),   # one full epoch worth of samples
-                       replacement=True,          # MUST be True for oversampling
-                   )
+        FileNotFoundError: if model_path does not exist.
 
     Notes:
-        - replacement=True is mandatory. Without it, oversampling minority classes
-          is impossible since you cannot draw more samples than exist.
-        - num_samples=len(labels) ensures each epoch sees the same number of
-          gradient updates regardless of class distribution changes.
-        - self.class_weights is set as a side effect of get_sampler().
-          Tests access it after calling get_sampler().
+        - weights_only=True is the PyTorch 2.x secure loading flag.
+        - map_location=device handles CUDA-trained models on CPU-only machines.
     """
+    if not model_path.exists():
+        raise FileNotFoundError(
+            f"Model file not found: {model_path}. "
+            "Run scripts/train.py to train the model first."
+        )
+    model = MalTwinCNN(num_classes=num_classes)
+    state_dict = torch.load(str(model_path), map_location=device, weights_only=True)
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+    return model
 
-    def __init__(self, dataset, strategy: str = "oversample_minority") -> None:
-        valid = {"oversample_minority", "sqrt_inverse", "uniform"}
-        if strategy not in valid:
-            raise ValueError(
-                f"Unknown oversampling strategy: '{strategy}'. "
-                f"Must be one of: oversample_minority, sqrt_inverse, uniform"
-            )
-        self.dataset  = dataset
-        self.strategy = strategy
-        self.class_weights: dict = {}   # populated by get_sampler()
 
-    def get_sampler(self) -> WeightedRandomSampler:
-        # implement here
-        ...
+def predict_single(
+    model: MalTwinCNN,
+    img_array: np.ndarray,
+    class_names: list[str],
+    device: torch.device = config.DEVICE,
+) -> dict:
+    """
+    Run inference on a single 128×128 grayscale image array.
+
+    Args:
+        model:       MalTwinCNN instance (eval mode recommended but enforced here)
+        img_array:   numpy array shape (128, 128), dtype uint8, values 0–255
+        class_names: ordered list of family names (index = class integer)
+        device:      inference device
+
+    Returns:
+        {
+            'predicted_family': str,               # top-1 class name
+            'confidence':       float,             # top-1 softmax probability [0.0, 1.0]
+            'probabilities':    dict[str, float],  # {family: prob} for ALL classes
+            'top3': [
+                {'family': str, 'confidence': float},  # rank 1
+                {'family': str, 'confidence': float},  # rank 2
+                {'family': str, 'confidence': float},  # rank 3
+            ]
+        }
+
+    All float values are Python float (JSON-serialisable, not numpy float32).
+
+    Pipeline:
+        1. PIL Image from uint8 array (mode='L')
+        2. get_val_transforms()(pil_img) → tensor (1, 128, 128) float32
+        3. unsqueeze(0) → (1, 1, 128, 128)
+        4. model.eval() + torch.no_grad() → logits (1, num_classes)
+        5. softmax → probs (num_classes,)
+        6. argmax → top-1; argsort descending → top-3
+    """
+    # 1. PIL Image
+    pil_img = Image.fromarray(img_array, mode='L')
+
+    # 2. Val transforms (ToTensor + Normalize) — NEVER train transforms for inference
+    transform = get_val_transforms(config.IMG_SIZE)
+    tensor = transform(pil_img)            # (1, 128, 128)
+
+    # 3. Batch dimension + device
+    tensor = tensor.unsqueeze(0).to(device)  # (1, 1, 128, 128)
+
+    # 4. Forward pass
+    model.eval()
+    with torch.no_grad():
+        logits = model(tensor)             # (1, num_classes)
+
+    # 5. Softmax probabilities
+    probs = torch.softmax(logits, dim=1).squeeze(0).cpu().numpy()
+    # probs shape: (num_classes,)
+
+    # 6. Top-1
+    top1_idx        = int(np.argmax(probs))
+    top1_confidence = float(probs[top1_idx])
+    top1_family     = class_names[top1_idx]
+
+    # 7. All probabilities dict
+    prob_dict = {class_names[i]: float(probs[i]) for i in range(len(class_names))}
+
+    # 8. Top-3 (descending by confidence)
+    top3_indices = np.argsort(probs)[::-1][:3]
+    top3 = [
+        {'family': class_names[int(i)], 'confidence': float(probs[i])}
+        for i in top3_indices
+    ]
+
+    return {
+        'predicted_family': top1_family,
+        'confidence':       top1_confidence,
+        'probabilities':    prob_dict,
+        'top3':             top3,
+    }
+
+
+def predict_batch(
+    model: MalTwinCNN,
+    img_arrays: list[np.ndarray],
+    class_names: list[str],
+    device: torch.device = config.DEVICE,
+    batch_size: int = 16,
+) -> list[dict]:
+    """
+    Run inference on multiple images. Returns list of result dicts (same format as predict_single).
+
+    Processes img_arrays in chunks of batch_size to avoid OOM on CPU.
+    Results are in the same order as input.
+
+    Implementation:
+        - For each chunk: stack transforms into (B, 1, 128, 128), forward, softmax.
+        - Decompose back into per-image dicts.
+    """
+    transform = get_val_transforms(config.IMG_SIZE)
+    results = []
+
+    model.eval()
+    with torch.no_grad():
+        for chunk_start in range(0, len(img_arrays), batch_size):
+            chunk = img_arrays[chunk_start:chunk_start + batch_size]
+
+            tensors = []
+            for arr in chunk:
+                pil_img = Image.fromarray(arr, mode='L')
+                tensors.append(transform(pil_img))
+
+            batch_tensor = torch.stack(tensors).to(device)   # (B, 1, 128, 128)
+            logits = model(batch_tensor)                      # (B, num_classes)
+            probs_batch = torch.softmax(logits, dim=1).cpu().numpy()  # (B, num_classes)
+
+            for probs in probs_batch:
+                top1_idx    = int(np.argmax(probs))
+                prob_dict   = {class_names[i]: float(probs[i]) for i in range(len(class_names))}
+                top3_idx    = np.argsort(probs)[::-1][:3]
+                top3        = [{'family': class_names[int(i)], 'confidence': float(probs[i])}
+                               for i in top3_idx]
+                results.append({
+                    'predicted_family': class_names[top1_idx],
+                    'confidence':       float(probs[top1_idx]),
+                    'probabilities':    prob_dict,
+                    'top3':             top3,
+                })
+
+    return results
 ```
 
 ---
 
-## FILE 3: `modules/enhancement/__init__.py`
+## File 6: `tests/test_model.py`
 
-```python
-from .augmentor import GaussianNoise, get_train_transforms, get_val_transforms
-from .balancer import ClassAwareOversampler
-
-__all__ = [
-    "GaussianNoise",
-    "get_train_transforms",
-    "get_val_transforms",
-    "ClassAwareOversampler",
-]
-```
-
----
-
-## FILE 4: `tests/test_enhancement.py`
-
-Implement all test classes and methods exactly as written. Do not skip or rename any.
+Write this file **exactly** as shown. Do not add, remove, or rename any test.
 
 ```python
 """
-Test suite for modules/enhancement/
-All tests are unit tests — no Malimg dataset required.
-Run: pytest tests/test_enhancement.py -v
+Test suite for modules/detection/model.py and modules/detection/inference.py
+
+All tests run without the Malimg dataset or a trained model.
+No @pytest.mark.integration tests are needed here — the model can be instantiated
+and inference can be run on random tensors without any dataset.
+
+Run:
+    pytest tests/test_model.py -v
 """
-import numpy as np
 import pytest
 import torch
-from PIL import Image
-from torch.utils.data import WeightedRandomSampler
-
-from modules.enhancement.augmentor import (
-    GaussianNoise,
-    get_train_transforms,
-    get_val_transforms,
-)
-from modules.enhancement.balancer import ClassAwareOversampler
+import numpy as np
+import json
+from modules.detection.model import MalTwinCNN, ConvBlock
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# ConvBlock tests
+# ─────────────────────────────────────────────────────────────────────────────
 
-def make_pil_grayscale(size: int = 128, seed: int = 0) -> Image.Image:
-    """Create a deterministic grayscale PIL Image in mode 'L'."""
-    rng = np.random.default_rng(seed=seed)
-    arr = rng.integers(0, 256, size=(size, size), dtype=np.uint8)
-    return Image.fromarray(arr, mode='L')
+class TestConvBlock:
+    def test_output_shape_block1(self):
+        """block1: (B, 1, 128, 128) → (B, 32, 64, 64) after MaxPool."""
+        block = ConvBlock(in_channels=1, out_channels=32)
+        x = torch.randn(4, 1, 128, 128)
+        out = block(x)
+        assert out.shape == (4, 32, 64, 64)
 
+    def test_output_shape_block2(self):
+        """block2: (B, 32, 64, 64) → (B, 64, 32, 32) after MaxPool."""
+        block = ConvBlock(in_channels=32, out_channels=64)
+        x = torch.randn(4, 32, 64, 64)
+        out = block(x)
+        assert out.shape == (4, 64, 32, 32)
 
-def make_tensor(size: int = 128, seed: int = 0) -> torch.Tensor:
-    """Create a deterministic float32 tensor in [0, 1], shape (1, size, size)."""
-    rng = np.random.default_rng(seed=seed)
-    arr = rng.random(size=(1, size, size)).astype(np.float32)
-    return torch.from_numpy(arr)
+    def test_output_shape_block3(self):
+        """block3: (B, 64, 32, 32) → (B, 128, 16, 16) after MaxPool."""
+        block = ConvBlock(in_channels=64, out_channels=128)
+        x = torch.randn(4, 64, 32, 32)
+        out = block(x)
+        assert out.shape == (4, 128, 16, 16)
 
+    def test_conv1_bias_false(self):
+        block = ConvBlock(1, 32)
+        assert block.conv1.bias is None, "Conv2d bias should be None when bias=False"
 
-class MockDataset:
-    """
-    Minimal mock dataset for balancer tests.
-    Exposes get_labels() and __len__() only.
-    """
-    def __init__(self, labels: list[int]) -> None:
-        self._labels = labels
+    def test_conv2_bias_false(self):
+        block = ConvBlock(1, 32)
+        assert block.conv2.bias is None, "Conv2d bias should be None when bias=False"
 
-    def get_labels(self) -> list[int]:
-        return list(self._labels)
+    def test_has_batchnorm(self):
+        import torch.nn as nn
+        block = ConvBlock(1, 32)
+        assert isinstance(block.bn1, nn.BatchNorm2d)
+        assert isinstance(block.bn2, nn.BatchNorm2d)
 
-    def __len__(self) -> int:
-        return len(self._labels)
+    def test_has_maxpool(self):
+        import torch.nn as nn
+        block = ConvBlock(1, 32)
+        assert isinstance(block.pool, nn.MaxPool2d)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# GaussianNoise
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TestGaussianNoise:
-
-    def test_output_same_shape_as_input(self):
-        noise = GaussianNoise()
-        t = make_tensor(128)
-        assert noise(t).shape == t.shape
-
-    def test_output_same_dtype_as_input(self):
-        noise = GaussianNoise()
-        t = make_tensor()
-        assert noise(t).dtype == t.dtype
-
-    def test_output_clamped_min_zero(self):
-        """Output must never be below 0.0."""
-        noise = GaussianNoise(std_range=(0.5, 1.0))   # large noise to stress-test clamping
-        t = torch.zeros(1, 128, 128)
-        result = noise(t)
-        assert result.min().item() >= 0.0
-
-    def test_output_clamped_max_one(self):
-        """Output must never exceed 1.0."""
-        noise = GaussianNoise(std_range=(0.5, 1.0))
-        t = torch.ones(1, 128, 128)
-        result = noise(t)
-        assert result.max().item() <= 1.0
-
-    def test_clamping_with_extreme_noise(self):
-        """Very high std should still produce valid output."""
-        noise = GaussianNoise(std_range=(10.0, 20.0))
-        t = make_tensor()
-        result = noise(t)
-        assert result.min().item() >= 0.0
-        assert result.max().item() <= 1.0
-
-    def test_noise_actually_changes_values(self):
-        """Noise must actually modify the tensor (not a no-op)."""
-        noise = GaussianNoise(std_range=(0.1, 0.2))
-        t = torch.full((1, 128, 128), 0.5)
-        result = noise(t)
-        assert not torch.equal(result, t)
-
-    def test_different_calls_produce_different_outputs(self):
-        """Each call samples a fresh noise tensor — outputs must differ."""
-        noise = GaussianNoise(std_range=(0.1, 0.2))
-        t = torch.full((1, 128, 128), 0.5)
-        r1 = noise(t)
-        r2 = noise(t)
-        # Two independent calls should differ (probability of exact equality is ~0)
-        assert not torch.equal(r1, r2)
-
-    def test_zero_std_range_is_identity(self):
-        """With std_range=(0, 0), mean=0: adds zero noise → output equals input."""
-        noise = GaussianNoise(mean=0.0, std_range=(0.0, 0.0))
-        t = make_tensor()
-        result = noise(t)
-        torch.testing.assert_close(result, t)
-
-    def test_output_on_zero_tensor_clamped_correctly(self):
-        """Black image + noise → some values rise, none fall below 0."""
-        noise = GaussianNoise(std_range=(0.05, 0.1))
-        t = torch.zeros(1, 128, 128)
-        result = noise(t)
-        assert result.min().item() >= 0.0
-        assert result.max().item() <= 1.0
-
-    def test_repr_contains_class_name(self):
-        noise = GaussianNoise(mean=0.0, std_range=(0.01, 0.05))
-        assert "GaussianNoise" in repr(noise)
-
-    def test_repr_contains_mean(self):
-        noise = GaussianNoise(mean=0.0, std_range=(0.01, 0.05))
-        assert "0.0" in repr(noise)
-
-    def test_output_is_float32(self):
-        noise = GaussianNoise()
-        t = torch.rand(1, 64, 64, dtype=torch.float32)
-        result = noise(t)
-        assert result.dtype == torch.float32
-
-    def test_works_on_batch_tensor(self):
-        """Should work on (B, 1, H, W) tensors too (not just (1, H, W))."""
-        noise = GaussianNoise()
-        t = torch.rand(4, 1, 128, 128)
-        result = noise(t)
-        assert result.shape == (4, 1, 128, 128)
-        assert result.min().item() >= 0.0
-        assert result.max().item() <= 1.0
+    def test_custom_dropout(self):
+        import torch.nn as nn
+        block = ConvBlock(1, 32, dropout_p=0.1)
+        assert isinstance(block.drop, nn.Dropout2d)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# get_train_transforms
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# MalTwinCNN architecture tests
+# ─────────────────────────────────────────────────────────────────────────────
 
-class TestGetTrainTransforms:
+class TestMalTwinCNN:
+    def test_forward_pass_output_shape(self, num_classes):
+        model = MalTwinCNN(num_classes=num_classes)
+        x = torch.randn(4, 1, 128, 128)
+        out = model(x)
+        assert out.shape == (4, num_classes)
 
-    def test_returns_compose(self):
-        from torchvision.transforms import Compose
-        assert isinstance(get_train_transforms(128), Compose)
+    def test_single_sample_forward(self, num_classes):
+        model = MalTwinCNN(num_classes=num_classes)
+        x = torch.randn(1, 1, 128, 128)
+        out = model(x)
+        assert out.shape == (1, num_classes)
 
-    def test_output_tensor_shape(self):
-        transform = get_train_transforms(128)
-        pil = make_pil_grayscale(128)
-        result = transform(pil)
-        assert result.shape == (1, 128, 128)
+    def test_parameter_count_reasonable(self, num_classes):
+        model = MalTwinCNN(num_classes=num_classes)
+        total = sum(p.numel() for p in model.parameters())
+        assert total > 1_000_000, f"Too few parameters: {total}"
+        assert total < 20_000_000, f"Too many parameters: {total}"
 
-    def test_output_dtype_float32(self):
-        transform = get_train_transforms(128)
-        result = transform(make_pil_grayscale(128))
-        assert result.dtype == torch.float32
-
-    def test_output_is_tensor(self):
-        transform = get_train_transforms(128)
-        result = transform(make_pil_grayscale(128))
-        assert isinstance(result, torch.Tensor)
-
-    def test_output_range_after_normalize(self):
+    def test_output_is_raw_logits_no_softmax(self, num_classes):
         """
-        After Normalize(mean=[0.5], std=[0.5]) the theoretical range is [-1, 1].
-        With GaussianNoise applied before Normalize, the values could be slightly
-        outside [-1, 1] but GaussianNoise clamps to [0, 1] first, so after Normalize
-        output is in [-1, 1].
-        We check a relaxed range to account for float precision.
+        Verify softmax was NOT applied in forward().
+        If softmax was applied, all outputs would be in [0,1] and sum to 1.
+        We verify that softmax of the output produces valid probabilities —
+        this tests the contract (logits in, probs after softmax), not the values.
         """
-        transform = get_train_transforms(128)
-        for seed in range(5):
-            pil = make_pil_grayscale(128, seed=seed)
-            result = transform(pil)
-            assert result.min().item() >= -1.05, f"seed={seed}: min={result.min().item()}"
-            assert result.max().item() <= 1.05,  f"seed={seed}: max={result.max().item()}"
+        model = MalTwinCNN(num_classes=num_classes)
+        model.eval()
+        x = torch.randn(2, 1, 128, 128)
+        with torch.no_grad():
+            out = model(x)
+        # Applying softmax to raw logits must yield probabilities that sum to 1
+        probs = torch.softmax(out, dim=1)
+        assert torch.allclose(probs.sum(dim=1), torch.ones(2), atol=1e-5)
 
-    def test_pure_black_image_normalizes_to_minus_one(self):
+    def test_gradcam_layer_attribute_exists(self, num_classes):
         """
-        Black image (all zeros) → ToTensor → [0.0] → GaussianNoise adds small noise
-        → clamped back → Normalize(0.5, 0.5): (0 - 0.5) / 0.5 = -1.0
-        With noise the result is close to -1.0 but not exact.
+        CRITICAL: self.gradcam_layer must be set and must point to block3.conv2.
+        This is required by Module 7 (Grad-CAM).
         """
-        transform = get_train_transforms(128)
-        black = Image.fromarray(np.zeros((128, 128), dtype=np.uint8), mode='L')
-        # Run multiple times; all should be close to -1
-        for _ in range(3):
-            result = transform(black)
-            assert result.mean().item() > -1.1   # with noise it won't be exactly -1
+        model = MalTwinCNN(num_classes=num_classes)
+        assert hasattr(model, 'gradcam_layer'), \
+            "MalTwinCNN must have self.gradcam_layer attribute"
+        assert model.gradcam_layer is model.block3.conv2, \
+            "gradcam_layer must be self.block3.conv2 (the second conv of block3)"
 
-    def test_accepts_pil_l_mode_input(self):
-        """Transform must work on PIL Image mode 'L' without raising."""
-        transform = get_train_transforms(128)
-        pil = Image.fromarray(np.zeros((128, 128), dtype=np.uint8), mode='L')
-        result = transform(pil)   # must not raise
-        assert result is not None
+    def test_block_attributes_exist(self, num_classes):
+        model = MalTwinCNN(num_classes=num_classes)
+        assert hasattr(model, 'block1')
+        assert hasattr(model, 'block2')
+        assert hasattr(model, 'block3')
+        assert hasattr(model, 'pool')
+        assert hasattr(model, 'classifier')
 
-    def test_stochastic_produces_different_results_on_same_input(self):
+    def test_block1_channels(self, num_classes):
+        model = MalTwinCNN(num_classes=num_classes)
+        assert model.block1.conv1.in_channels == 1
+        assert model.block1.conv1.out_channels == 32
+
+    def test_block2_channels(self, num_classes):
+        model = MalTwinCNN(num_classes=num_classes)
+        assert model.block2.conv1.in_channels == 32
+        assert model.block2.conv1.out_channels == 64
+
+    def test_block3_channels(self, num_classes):
+        model = MalTwinCNN(num_classes=num_classes)
+        assert model.block3.conv1.in_channels == 64
+        assert model.block3.conv1.out_channels == 128
+
+    def test_deterministic_in_eval_mode(self, num_classes):
+        model = MalTwinCNN(num_classes=num_classes)
+        model.eval()
+        x = torch.randn(2, 1, 128, 128)
+        with torch.no_grad():
+            out1 = model(x)
+            out2 = model(x)
+        torch.testing.assert_close(out1, out2)
+
+    def test_train_mode_dropout_nondeterministic(self, num_classes):
+        """In train mode, Dropout causes different outputs for different seeds."""
+        model = MalTwinCNN(num_classes=num_classes)
+        model.train()
+        x = torch.randn(4, 1, 128, 128)
+        torch.manual_seed(0)
+        out1 = model(x)
+        torch.manual_seed(1)
+        out2 = model(x)
+        assert not torch.equal(out1, out2)
+
+    def test_weight_initialization_conv_no_zeros(self, num_classes):
+        """Kaiming init should produce non-zero weights."""
+        model = MalTwinCNN(num_classes=num_classes)
+        # At least some weights should be nonzero after Kaiming init
+        conv_weights = model.block1.conv1.weight.data
+        assert conv_weights.abs().sum() > 0
+
+    def test_batchnorm_initialized_correctly(self, num_classes):
+        """BatchNorm weight=1, bias=0 after _initialize_weights."""
+        model = MalTwinCNN(num_classes=num_classes)
+        # Check block1's BN
+        assert torch.allclose(model.block1.bn1.weight, torch.ones_like(model.block1.bn1.weight))
+        assert torch.allclose(model.block1.bn1.bias, torch.zeros_like(model.block1.bn1.bias))
+
+    def test_adaptive_avg_pool_output(self, num_classes):
+        """AdaptiveAvgPool2d should output (B, 128, 4, 4) before flatten."""
+        import torch.nn as nn
+        model = MalTwinCNN(num_classes=num_classes)
+        # Run up to just before classifier
+        x = torch.randn(2, 1, 128, 128)
+        x = model.block1(x)   # (2, 32, 64, 64)
+        x = model.block2(x)   # (2, 64, 32, 32)
+        x = model.block3(x)   # (2, 128, 16, 16)
+        x = model.pool(x)     # (2, 128, 4, 4)
+        assert x.shape == (2, 128, 4, 4)
+
+    def test_classifier_output_size(self, num_classes):
+        """Classifier input should be 128*4*4=2048."""
+        model = MalTwinCNN(num_classes=num_classes)
+        # Find the first Linear layer in classifier
+        import torch.nn as nn
+        first_linear = next(m for m in model.classifier.modules() if isinstance(m, nn.Linear))
+        assert first_linear.in_features == 2048
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Inference tests (predict_single, load_model)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPredictSingle:
+    def _make_result(self, num_classes, sample_grayscale_array):
+        from modules.detection.inference import predict_single
+        model = MalTwinCNN(num_classes=num_classes)
+        model.eval()
+        class_names = [f"Family_{i:02d}" for i in range(num_classes)]
+        return predict_single(model, sample_grayscale_array, class_names, torch.device('cpu'))
+
+    def test_returns_required_keys(self, sample_grayscale_array, num_classes):
+        result = self._make_result(num_classes, sample_grayscale_array)
+        assert 'predicted_family' in result
+        assert 'confidence' in result
+        assert 'probabilities' in result
+        assert 'top3' in result
+
+    def test_confidence_in_valid_range(self, sample_grayscale_array, num_classes):
+        result = self._make_result(num_classes, sample_grayscale_array)
+        assert 0.0 <= result['confidence'] <= 1.0
+
+    def test_probabilities_sum_to_one(self, sample_grayscale_array, num_classes):
+        result = self._make_result(num_classes, sample_grayscale_array)
+        total = sum(result['probabilities'].values())
+        assert abs(total - 1.0) < 1e-5
+
+    def test_probabilities_has_all_classes(self, sample_grayscale_array, num_classes):
+        result = self._make_result(num_classes, sample_grayscale_array)
+        assert len(result['probabilities']) == num_classes
+
+    def test_all_probabilities_nonnegative(self, sample_grayscale_array, num_classes):
+        result = self._make_result(num_classes, sample_grayscale_array)
+        assert all(v >= 0.0 for v in result['probabilities'].values())
+
+    def test_all_probabilities_at_most_one(self, sample_grayscale_array, num_classes):
+        result = self._make_result(num_classes, sample_grayscale_array)
+        assert all(v <= 1.0 for v in result['probabilities'].values())
+
+    def test_top3_has_three_entries(self, sample_grayscale_array, num_classes):
+        result = self._make_result(num_classes, sample_grayscale_array)
+        assert len(result['top3']) == 3
+
+    def test_top3_entries_have_required_keys(self, sample_grayscale_array, num_classes):
+        result = self._make_result(num_classes, sample_grayscale_array)
+        for entry in result['top3']:
+            assert 'family' in entry
+            assert 'confidence' in entry
+
+    def test_predicted_family_matches_top3_first(self, sample_grayscale_array, num_classes):
+        result = self._make_result(num_classes, sample_grayscale_array)
+        assert result['predicted_family'] == result['top3'][0]['family']
+
+    def test_predicted_family_confidence_matches_top3_first(self, sample_grayscale_array, num_classes):
+        result = self._make_result(num_classes, sample_grayscale_array)
+        assert abs(result['confidence'] - result['top3'][0]['confidence']) < 1e-6
+
+    def test_top3_sorted_descending(self, sample_grayscale_array, num_classes):
+        result = self._make_result(num_classes, sample_grayscale_array)
+        confs = [item['confidence'] for item in result['top3']]
+        assert confs == sorted(confs, reverse=True)
+
+    def test_predicted_family_is_valid_class(self, sample_grayscale_array, num_classes):
+        result = self._make_result(num_classes, sample_grayscale_array)
+        class_names = [f"Family_{i:02d}" for i in range(num_classes)]
+        assert result['predicted_family'] in class_names
+
+    def test_all_values_json_serialisable(self, sample_grayscale_array, num_classes):
+        """All float values must be Python float, not numpy float32."""
+        result = self._make_result(num_classes, sample_grayscale_array)
+        # Should not raise TypeError
+        json.dumps(result)
+
+    def test_confidence_is_python_float(self, sample_grayscale_array, num_classes):
+        result = self._make_result(num_classes, sample_grayscale_array)
+        assert isinstance(result['confidence'], float)
+
+    def test_uses_val_transforms_not_train(self, sample_grayscale_array, num_classes):
         """
-        Training transforms are stochastic. Two calls on identical input
-        should produce different tensors (with overwhelming probability).
+        Calling predict_single twice on the same image should return identical results
+        (val transforms are deterministic; train transforms are not).
         """
-        transform = get_train_transforms(128)
-        pil = make_pil_grayscale(128, seed=7)
-        outputs = [transform(pil) for _ in range(5)]
-        # At least two outputs should differ
-        all_equal = all(torch.equal(outputs[0], o) for o in outputs[1:])
-        assert not all_equal, "Training transforms appear to be deterministic — check stochastic stages"
-
-    def test_contains_gaussian_noise(self):
-        """Pipeline must include GaussianNoise after ToTensor."""
-        transform = get_train_transforms(128)
-        has_gaussian = any(isinstance(t, GaussianNoise) for t in transform.transforms)
-        assert has_gaussian, "get_train_transforms must include GaussianNoise"
-
-    def test_contains_to_tensor(self):
-        from torchvision.transforms import ToTensor
-        transform = get_train_transforms(128)
-        has_to_tensor = any(isinstance(t, ToTensor) for t in transform.transforms)
-        assert has_to_tensor, "get_train_transforms must include ToTensor"
-
-    def test_contains_normalize(self):
-        from torchvision.transforms import Normalize
-        transform = get_train_transforms(128)
-        has_normalize = any(isinstance(t, Normalize) for t in transform.transforms)
-        assert has_normalize, "get_train_transforms must include Normalize"
-
-    def test_gaussian_noise_comes_after_to_tensor(self):
-        """
-        GaussianNoise must be positioned after ToTensor in the pipeline.
-        Verify by checking index positions.
-        """
-        from torchvision.transforms import ToTensor
-        transform = get_train_transforms(128)
-        ts = transform.transforms
-        to_tensor_idx   = next(i for i, t in enumerate(ts) if isinstance(t, ToTensor))
-        gaussian_idx    = next(i for i, t in enumerate(ts) if isinstance(t, GaussianNoise))
-        assert gaussian_idx > to_tensor_idx, (
-            f"GaussianNoise (idx={gaussian_idx}) must come after "
-            f"ToTensor (idx={to_tensor_idx})"
-        )
-
-    def test_normalize_is_last_transform(self):
-        from torchvision.transforms import Normalize
-        transform = get_train_transforms(128)
-        last = transform.transforms[-1]
-        assert isinstance(last, Normalize), (
-            f"Last transform must be Normalize, got {type(last).__name__}"
-        )
-
-    def test_color_jitter_comes_before_to_tensor(self):
-        """ColorJitter operates on PIL — must be before ToTensor."""
-        from torchvision.transforms import ColorJitter, ToTensor
-        transform = get_train_transforms(128)
-        ts = transform.transforms
-        to_tensor_idx = next(i for i, t in enumerate(ts) if isinstance(t, ToTensor))
-        jitter_indices = [i for i, t in enumerate(ts) if isinstance(t, ColorJitter)]
-        assert len(jitter_indices) > 0, "get_train_transforms must include ColorJitter"
-        assert all(idx < to_tensor_idx for idx in jitter_indices), (
-            "ColorJitter must come before ToTensor"
-        )
-
-    def test_more_transforms_than_val(self):
-        """Train pipeline has more transforms than val pipeline."""
-        train_tf = get_train_transforms(128)
-        val_tf   = get_val_transforms(128)
-        assert len(train_tf.transforms) > len(val_tf.transforms)
-
-    def test_normalize_uses_single_channel_params(self):
-        """Normalize must use mean=[0.5], std=[0.5] — single-element lists."""
-        from torchvision.transforms import Normalize
-        transform = get_train_transforms(128)
-        normalize = next(t for t in transform.transforms if isinstance(t, Normalize))
-        assert list(normalize.mean) == [0.5], f"Expected mean=[0.5], got {normalize.mean}"
-        assert list(normalize.std)  == [0.5], f"Expected std=[0.5],  got {normalize.std}"
+        from modules.detection.inference import predict_single
+        model = MalTwinCNN(num_classes=num_classes)
+        model.eval()
+        class_names = [f"Family_{i:02d}" for i in range(num_classes)]
+        r1 = predict_single(model, sample_grayscale_array, class_names, torch.device('cpu'))
+        r2 = predict_single(model, sample_grayscale_array, class_names, torch.device('cpu'))
+        assert r1['predicted_family'] == r2['predicted_family']
+        assert abs(r1['confidence'] - r2['confidence']) < 1e-6
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# get_val_transforms
-# ══════════════════════════════════════════════════════════════════════════════
+class TestLoadModel:
+    def test_raises_on_missing_file(self, tmp_path):
+        from modules.detection.inference import load_model
+        missing = tmp_path / 'nonexistent.pt'
+        with pytest.raises(FileNotFoundError, match="not found"):
+            load_model(model_path=missing, num_classes=25, device=torch.device('cpu'))
 
-class TestGetValTransforms:
+    def test_loads_saved_state_dict(self, tmp_path, num_classes):
+        from modules.detection.inference import load_model
+        # Save a freshly initialised model's state dict
+        model = MalTwinCNN(num_classes=num_classes)
+        pt_path = tmp_path / 'test_model.pt'
+        torch.save(model.state_dict(), pt_path)
 
-    def test_returns_compose(self):
-        from torchvision.transforms import Compose
-        assert isinstance(get_val_transforms(128), Compose)
+        # Load it back
+        loaded = load_model(model_path=pt_path, num_classes=num_classes, device=torch.device('cpu'))
+        assert isinstance(loaded, MalTwinCNN)
 
-    def test_output_tensor_shape(self):
-        transform = get_val_transforms(128)
-        result = transform(make_pil_grayscale(128))
-        assert result.shape == (1, 128, 128)
+    def test_loaded_model_is_in_eval_mode(self, tmp_path, num_classes):
+        from modules.detection.inference import load_model
+        model = MalTwinCNN(num_classes=num_classes)
+        pt_path = tmp_path / 'test_model.pt'
+        torch.save(model.state_dict(), pt_path)
+        loaded = load_model(model_path=pt_path, num_classes=num_classes, device=torch.device('cpu'))
+        assert not loaded.training, "load_model() must return model in eval() mode"
 
-    def test_output_dtype_float32(self):
-        transform = get_val_transforms(128)
-        result = transform(make_pil_grayscale(128))
-        assert result.dtype == torch.float32
+    def test_loaded_model_produces_correct_output_shape(self, tmp_path, num_classes):
+        from modules.detection.inference import load_model
+        model = MalTwinCNN(num_classes=num_classes)
+        pt_path = tmp_path / 'test_model.pt'
+        torch.save(model.state_dict(), pt_path)
+        loaded = load_model(model_path=pt_path, num_classes=num_classes, device=torch.device('cpu'))
+        x = torch.randn(1, 1, 128, 128)
+        with torch.no_grad():
+            out = loaded(x)
+        assert out.shape == (1, num_classes)
 
-    def test_is_deterministic(self):
-        """Same input must always produce exactly the same tensor."""
-        transform = get_val_transforms(128)
-        arr = np.random.default_rng(seed=42).integers(0,256,(128,128),dtype=np.uint8)
-        pil1 = Image.fromarray(arr, mode='L')
-        pil2 = Image.fromarray(arr, mode='L')
-        r1 = transform(pil1)
-        r2 = transform(pil2)
-        torch.testing.assert_close(r1, r2)
+    def test_loaded_weights_match_original(self, tmp_path, num_classes):
+        from modules.detection.inference import load_model
+        model = MalTwinCNN(num_classes=num_classes)
+        pt_path = tmp_path / 'test_model.pt'
+        torch.save(model.state_dict(), pt_path)
+        loaded = load_model(model_path=pt_path, num_classes=num_classes, device=torch.device('cpu'))
 
-    def test_pure_black_image_outputs_minus_one(self):
-        """Black image → ToTensor → 0.0 → Normalize(0.5,0.5) → -1.0"""
-        transform = get_val_transforms(128)
-        black = Image.fromarray(np.zeros((128, 128), dtype=np.uint8), mode='L')
-        result = transform(black)
-        torch.testing.assert_close(result, torch.full((1, 128, 128), -1.0))
-
-    def test_pure_white_image_outputs_plus_one(self):
-        """White image → ToTensor → 1.0 → Normalize(0.5,0.5) → 1.0"""
-        transform = get_val_transforms(128)
-        white = Image.fromarray(np.full((128, 128), 255, dtype=np.uint8), mode='L')
-        result = transform(white)
-        torch.testing.assert_close(result, torch.full((1, 128, 128), 1.0), atol=1e-5, rtol=0)
-
-    def test_output_range_is_minus_one_to_plus_one(self):
-        transform = get_val_transforms(128)
-        for seed in range(5):
-            result = transform(make_pil_grayscale(128, seed=seed))
-            assert result.min().item() >= -1.0 - 1e-5
-            assert result.max().item() <= 1.0  + 1e-5
-
-    def test_does_not_contain_gaussian_noise(self):
-        transform = get_val_transforms(128)
-        has_gaussian = any(isinstance(t, GaussianNoise) for t in transform.transforms)
-        assert not has_gaussian, "get_val_transforms must NOT include GaussianNoise"
-
-    def test_does_not_contain_random_flip(self):
-        from torchvision.transforms import RandomHorizontalFlip, RandomVerticalFlip
-        transform = get_val_transforms(128)
-        for t in transform.transforms:
-            assert not isinstance(t, (RandomHorizontalFlip, RandomVerticalFlip)), \
-                "get_val_transforms must not contain random flips"
-
-    def test_does_not_contain_random_rotation(self):
-        from torchvision.transforms import RandomRotation
-        transform = get_val_transforms(128)
-        for t in transform.transforms:
-            assert not isinstance(t, RandomRotation), \
-                "get_val_transforms must not contain RandomRotation"
-
-    def test_does_not_contain_color_jitter(self):
-        from torchvision.transforms import ColorJitter
-        transform = get_val_transforms(128)
-        for t in transform.transforms:
-            assert not isinstance(t, ColorJitter), \
-                "get_val_transforms must not contain ColorJitter"
-
-    def test_exactly_two_transforms(self):
-        """Val pipeline must have exactly: ToTensor, Normalize."""
-        transform = get_val_transforms(128)
-        assert len(transform.transforms) == 2, (
-            f"Expected exactly 2 transforms, got {len(transform.transforms)}: "
-            f"{[type(t).__name__ for t in transform.transforms]}"
-        )
-
-    def test_normalize_uses_single_channel_params(self):
-        from torchvision.transforms import Normalize
-        transform = get_val_transforms(128)
-        normalize = next(t for t in transform.transforms if isinstance(t, Normalize))
-        assert list(normalize.mean) == [0.5]
-        assert list(normalize.std)  == [0.5]
-
-    def test_accepts_pil_l_mode_input(self):
-        transform = get_val_transforms(128)
-        pil = Image.fromarray(np.zeros((128, 128), dtype=np.uint8), mode='L')
-        result = transform(pil)
-        assert result is not None
+        original_w = model.block1.conv1.weight.data
+        loaded_w   = loaded.block1.conv1.weight.data
+        torch.testing.assert_close(original_w, loaded_w)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ClassAwareOversampler
-# ══════════════════════════════════════════════════════════════════════════════
+class TestPredictBatch:
+    def test_returns_list_of_dicts(self, sample_grayscale_array, num_classes):
+        from modules.detection.inference import predict_batch
+        model = MalTwinCNN(num_classes=num_classes)
+        model.eval()
+        class_names = [f"Family_{i:02d}" for i in range(num_classes)]
+        results = predict_batch(model, [sample_grayscale_array, sample_grayscale_array],
+                                class_names, torch.device('cpu'))
+        assert isinstance(results, list)
+        assert len(results) == 2
 
-class TestClassAwareOversamplerInit:
+    def test_batch_results_match_single(self, sample_grayscale_array, num_classes):
+        """predict_batch on one image should match predict_single on same image."""
+        from modules.detection.inference import predict_batch, predict_single
+        model = MalTwinCNN(num_classes=num_classes)
+        model.eval()
+        class_names = [f"Family_{i:02d}" for i in range(num_classes)]
 
-    def test_invalid_strategy_raises_value_error(self):
-        ds = MockDataset([0, 1, 2])
-        with pytest.raises(ValueError, match="Unknown oversampling strategy"):
-            ClassAwareOversampler(ds, strategy="nonexistent")
+        single = predict_single(model, sample_grayscale_array, class_names, torch.device('cpu'))
+        batch  = predict_batch(model, [sample_grayscale_array], class_names, torch.device('cpu'))
 
-    def test_valid_strategies_do_not_raise(self):
-        ds = MockDataset([0, 1, 2])
-        for strategy in ["oversample_minority", "sqrt_inverse", "uniform"]:
-            ClassAwareOversampler(ds, strategy=strategy)   # must not raise
+        assert single['predicted_family'] == batch[0]['predicted_family']
+        assert abs(single['confidence'] - batch[0]['confidence']) < 1e-5
 
-    def test_stores_strategy(self):
-        ds = MockDataset([0, 1, 2])
-        o = ClassAwareOversampler(ds, strategy="uniform")
-        assert o.strategy == "uniform"
+    def test_result_order_preserved(self, num_classes):
+        """Results must be in same order as inputs."""
+        from modules.detection.inference import predict_batch
+        import cv2
+        model = MalTwinCNN(num_classes=num_classes)
+        model.eval()
+        class_names = [f"Family_{i:02d}" for i in range(num_classes)]
 
-    def test_default_strategy_is_oversample_minority(self):
-        ds = MockDataset([0, 1, 2])
-        o = ClassAwareOversampler(ds)
-        assert o.strategy == "oversample_minority"
+        # Create two distinct arrays: all-zeros and all-255
+        arr_black = np.zeros((128, 128), dtype=np.uint8)
+        arr_white = np.full((128, 128), 255, dtype=np.uint8)
 
-
-class TestClassAwareOversamplerGetSampler:
-
-    def test_returns_weighted_random_sampler(self):
-        ds = MockDataset([0] * 100 + [1] * 10 + [2] * 5)
-        sampler = ClassAwareOversampler(ds).get_sampler()
-        assert isinstance(sampler, WeightedRandomSampler)
-
-    def test_num_samples_equals_dataset_length(self):
-        labels = [0] * 100 + [1] * 10 + [2] * 5
-        ds = MockDataset(labels)
-        sampler = ClassAwareOversampler(ds).get_sampler()
-        assert sampler.num_samples == len(labels)
-
-    def test_replacement_is_true(self):
-        ds = MockDataset([0] * 50 + [1] * 5)
-        sampler = ClassAwareOversampler(ds).get_sampler()
-        assert sampler.replacement is True
-
-    def test_class_weights_set_as_attribute(self):
-        """class_weights dict must be accessible after get_sampler() is called."""
-        ds = MockDataset([0] * 100 + [1] * 10)
-        o = ClassAwareOversampler(ds)
-        o.get_sampler()
-        assert hasattr(o, 'class_weights')
-        assert isinstance(o.class_weights, dict)
-        assert 0 in o.class_weights
-        assert 1 in o.class_weights
-
-    def test_oversample_minority_weights_minority_higher(self):
-        """Class 1 (10 samples) must get higher weight than class 0 (100 samples)."""
-        ds = MockDataset([0] * 100 + [1] * 10)
-        o = ClassAwareOversampler(ds, strategy="oversample_minority")
-        o.get_sampler()
-        assert o.class_weights[1] > o.class_weights[0], (
-            f"Minority class weight {o.class_weights[1]} should be > "
-            f"majority class weight {o.class_weights[0]}"
-        )
-
-    def test_oversample_minority_weight_formula(self):
-        """Weight must be exactly 1.0 / count for each class."""
-        labels = [0] * 100 + [1] * 20 + [2] * 5
-        ds = MockDataset(labels)
-        o = ClassAwareOversampler(ds, strategy="oversample_minority")
-        o.get_sampler()
-        assert abs(o.class_weights[0] - 1.0 / 100) < 1e-9
-        assert abs(o.class_weights[1] - 1.0 / 20)  < 1e-9
-        assert abs(o.class_weights[2] - 1.0 / 5)   < 1e-9
-
-    def test_sqrt_inverse_weight_formula(self):
-        """Weight must be exactly 1.0 / sqrt(count) for each class."""
-        import math
-        labels = [0] * 100 + [1] * 25
-        ds = MockDataset(labels)
-        o = ClassAwareOversampler(ds, strategy="sqrt_inverse")
-        o.get_sampler()
-        assert abs(o.class_weights[0] - 1.0 / math.sqrt(100)) < 1e-9
-        assert abs(o.class_weights[1] - 1.0 / math.sqrt(25))  < 1e-9
-
-    def test_sqrt_inverse_minority_still_weighted_higher(self):
-        """Even with sqrt_inverse, minority should weigh more than majority."""
-        ds = MockDataset([0] * 100 + [1] * 10)
-        o = ClassAwareOversampler(ds, strategy="sqrt_inverse")
-        o.get_sampler()
-        assert o.class_weights[1] > o.class_weights[0]
-
-    def test_uniform_all_weights_equal_one(self):
-        labels = [0] * 100 + [1] * 10 + [2] * 5
-        ds = MockDataset(labels)
-        o = ClassAwareOversampler(ds, strategy="uniform")
-        o.get_sampler()
-        for cls, weight in o.class_weights.items():
-            assert abs(weight - 1.0) < 1e-9, f"Class {cls} weight should be 1.0, got {weight}"
-
-    def test_uniform_sampler_weights_per_sample_all_equal(self):
-        """With uniform strategy, every sample has the same weight."""
-        labels = [0] * 100 + [1] * 10
-        ds = MockDataset(labels)
-        sampler = ClassAwareOversampler(ds, strategy="uniform").get_sampler()
-        weights = sampler.weights
-        assert torch.allclose(weights, torch.ones_like(weights)), \
-            "Uniform strategy should give all samples weight 1.0"
-
-    def test_sample_weights_tensor_is_float32(self):
-        ds = MockDataset([0] * 50 + [1] * 50)
-        sampler = ClassAwareOversampler(ds).get_sampler()
-        assert sampler.weights.dtype == torch.float32
-
-    def test_sample_weights_length_equals_dataset(self):
-        labels = [0] * 80 + [1] * 20
-        ds = MockDataset(labels)
-        sampler = ClassAwareOversampler(ds).get_sampler()
-        assert len(sampler.weights) == len(labels)
-
-    def test_all_sample_weights_positive(self):
-        """No sample should have zero or negative weight."""
-        labels = [0] * 100 + [1] * 10 + [2] * 5
-        ds = MockDataset(labels)
-        sampler = ClassAwareOversampler(ds).get_sampler()
-        assert (sampler.weights > 0).all()
-
-    def test_works_with_single_class(self):
-        """Edge case: all samples belong to one class."""
-        ds = MockDataset([0] * 50)
-        sampler = ClassAwareOversampler(ds).get_sampler()
-        assert isinstance(sampler, WeightedRandomSampler)
-        assert sampler.num_samples == 50
-
-    def test_works_with_25_classes(self, sample_class_names):
-        """Stress test with Malimg-like 25-class imbalanced distribution."""
-        rng = np.random.default_rng(seed=0)
-        # Simulate Malimg imbalance: classes 0-24 with varying counts
-        labels = []
-        counts = [2949, 1591, 800, 431, 408, 381, 213, 200, 198, 184,
-                  177, 162, 159, 158, 146, 142, 136, 132, 128, 123,
-                  122, 116, 106, 97, 80]
-        for cls, count in enumerate(counts):
-            labels.extend([cls] * count)
-        ds = MockDataset(labels)
-        sampler = ClassAwareOversampler(ds, strategy="oversample_minority").get_sampler()
-        assert isinstance(sampler, WeightedRandomSampler)
-        assert sampler.num_samples == len(labels)
-
-    def test_minority_class_has_highest_weight_in_25_class(self, sample_class_names):
-        """Skintrim.N (class 24, 80 samples) should have highest weight."""
-        counts = [2949, 1591, 800, 431, 408, 381, 213, 200, 198, 184,
-                  177, 162, 159, 158, 146, 142, 136, 132, 128, 123,
-                  122, 116, 106, 97, 80]
-        labels = []
-        for cls, count in enumerate(counts):
-            labels.extend([cls] * count)
-        ds = MockDataset(labels)
-        o = ClassAwareOversampler(ds, strategy="oversample_minority")
-        o.get_sampler()
-        max_weight_class = max(o.class_weights, key=o.class_weights.get)
-        # Class 24 has 80 samples (fewest) → highest weight
-        assert max_weight_class == 24, (
-            f"Expected class 24 (80 samples) to have highest weight, "
-            f"got class {max_weight_class}"
-        )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Integration: transforms + oversampler work together
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TestTransformOversamplerIntegration:
-
-    def test_train_transforms_output_compatible_with_model_input(self):
-        """
-        Output of get_train_transforms must be directly usable as CNN input.
-        Shape: (1, 128, 128) — single channel, 128x128.
-        dtype: float32.
-        """
-        transform = get_train_transforms(128)
-        pil = make_pil_grayscale(128)
-        tensor = transform(pil)
-        assert tensor.shape == (1, 128, 128)
-        assert tensor.dtype == torch.float32
-
-    def test_val_transforms_output_compatible_with_model_input(self):
-        transform = get_val_transforms(128)
-        pil = make_pil_grayscale(128)
-        tensor = transform(pil)
-        assert tensor.shape == (1, 128, 128)
-        assert tensor.dtype == torch.float32
-
-    def test_train_and_val_differ_on_same_input(self):
-        """
-        Training transforms are stochastic. They should (almost certainly)
-        produce different output than val transforms on the same input.
-        Test across multiple seeds for robustness.
-        """
-        train_tf = get_train_transforms(128)
-        val_tf   = get_val_transforms(128)
-        found_difference = False
-        for seed in range(10):
-            pil_for_train = make_pil_grayscale(128, seed=seed)
-            pil_for_val   = make_pil_grayscale(128, seed=seed)   # identical image
-            t_out = train_tf(pil_for_train)
-            v_out = val_tf(pil_for_val)
-            if not torch.equal(t_out, v_out):
-                found_difference = True
-                break
-        assert found_difference, (
-            "train and val transforms produced identical output for 10 seeds — "
-            "training transforms appear non-stochastic"
-        )
-
-    def test_oversampler_can_be_used_with_dataloader(self):
-        """
-        WeightedRandomSampler from ClassAwareOversampler must be accepted by
-        torch.utils.data.DataLoader without error.
-        """
-        from torch.utils.data import DataLoader, TensorDataset
-
-        # Build a tiny fake dataset with 3 classes (20 + 5 + 2 = 27 samples)
-        labels = [0] * 20 + [1] * 5 + [2] * 2
-
-        class FakeDataset:
-            def __init__(self, labels):
-                self._labels = labels
-                self._data = [
-                    (torch.zeros(1, 128, 128), lbl)
-                    for lbl in labels
-                ]
-            def get_labels(self):
-                return list(self._labels)
-            def __len__(self):
-                return len(self._labels)
-            def __getitem__(self, idx):
-                return self._data[idx]
-
-        ds = FakeDataset(labels)
-        sampler = ClassAwareOversampler(ds, strategy="oversample_minority").get_sampler()
-        loader = DataLoader(ds, batch_size=4, sampler=sampler)
-
-        # Draw one batch — must not raise
-        batch_data, batch_labels = next(iter(loader))
-        assert batch_data.shape == (4, 1, 128, 128)
-        assert batch_labels.shape == (4,)
+        results = predict_batch(model, [arr_black, arr_white], class_names, torch.device('cpu'))
+        assert len(results) == 2
+        # Both should return valid results (can't predict which family, but structure valid)
+        for r in results:
+            assert 'predicted_family' in r
+            assert 'confidence' in r
 ```
 
 ---
 
-## DEFINITION OF DONE
+## Definition of Done
 
-Before marking this phase complete, run the following and verify all pass:
+Run these commands. All must pass before Phase 4 is complete.
 
 ```bash
-# Run the full test suite for this phase
-pytest tests/test_enhancement.py -v
+# Phase 4 tests — no dataset, no trained model required
+pytest tests/test_model.py -v
 
-# Expected: all tests PASSED, 0 failed, 0 errors
-# Approximate count: 65–70 test cases
+# Expected: all tests pass with zero failures
+# ====== 40+ passed ======
 
-# Verify imports work cleanly from the project root
-python -c "
-from modules.enhancement.augmentor import get_train_transforms, get_val_transforms, GaussianNoise
-from modules.enhancement.balancer import ClassAwareOversampler
-print('All imports OK')
-
-from PIL import Image
-import numpy as np
-import torch
-
-pil = Image.fromarray(np.zeros((128, 128), dtype=np.uint8), mode='L')
-t = get_train_transforms(128)(pil)
-v = get_val_transforms(128)(pil)
-print(f'Train output shape: {t.shape}  dtype: {t.dtype}  range: [{t.min():.3f}, {t.max():.3f}]')
-print(f'Val   output shape: {v.shape}  dtype: {v.dtype}  range: [{v.min():.3f}, {v.max():.3f}]')
-
-class MockDS:
-    def get_labels(self): return [0]*100 + [1]*10
-mock = MockDS()
-from torch.utils.data import WeightedRandomSampler
-sampler = ClassAwareOversampler(mock).get_sampler()
-print(f'Sampler type: {type(sampler).__name__}  num_samples: {sampler.num_samples}')
-"
-
-# Verify no breakage of Phase 2 imports
-python -c "
-from modules.dataset.loader import get_dataloaders
-print('Phase 2 imports still OK')
-"
+# Regression check — phases 1, 2, 3 must still pass
+pytest tests/test_converter.py tests/test_dataset.py tests/test_enhancement.py \
+       -v -m "not integration"
 ```
+
+### Checklist
+
+- [ ] `pytest tests/test_model.py -v` passes with zero failures
+- [ ] No regressions in earlier test files
+- [ ] `MalTwinCNN.__init__` sets `self.gradcam_layer = self.block3.conv2`
+- [ ] `model.forward()` returns raw logits — NO `torch.softmax()` inside `forward()`
+- [ ] `CrossEntropyLoss` is used in `trainer.py` (not NLLLoss + softmax)
+- [ ] `torch.manual_seed(config.RANDOM_SEED)` is at the **top of `train()`**, not module level
+- [ ] `validate_epoch()` uses `model.eval()` + `torch.no_grad()` together
+- [ ] `matplotlib.use('Agg')` is at **module level** in `evaluator.py` (before any plt import)
+- [ ] `plt.close(fig)` is called after `plt.savefig()` in `plot_confusion_matrix()`
+- [ ] `torch.load(..., weights_only=True)` is used in `load_model()`
+- [ ] `predict_single()` calls `get_val_transforms`, not `get_train_transforms`
+- [ ] All probability values returned by `predict_single()` are Python `float`, not `np.float32`
+- [ ] `load_model()` returns model in `eval()` mode
+- [ ] `bias=False` in all Conv2d layers in `ConvBlock`
 
 ---
 
-## WHAT NOT TO IMPLEMENT IN THIS PHASE
+## Common Bugs to Avoid
 
-- `modules/detection/` — Phase 4
-- `modules/dashboard/` — Phase 6
-- `scripts/train.py` — Phase 5
-- Any changes to `modules/dataset/` beyond fixing a broken import for this module
-- Any changes to `modules/binary_to_image/`
+| Bug | Symptom | Fix |
+|-----|---------|-----|
+| `torch.softmax()` inside `forward()` | CrossEntropyLoss produces wrong gradients; model trains poorly | Remove softmax from `forward()`. Apply in `predict_single()` only. |
+| Forgetting `self.gradcam_layer = self.block3.conv2` | `test_gradcam_layer_attribute_exists` fails | Set it explicitly in `__init__` after `self.block3` is created |
+| `matplotlib.use('Agg')` inside a function | Fails if any plt has already been imported elsewhere | Must be at **module level**, line 3–4 of evaluator.py |
+| Missing `plt.close(fig)` | Memory leak during long training runs | Always `plt.close(fig)` after `plt.savefig()` |
+| `torch.load()` without `weights_only=True` | PyTorch 2.x security warning; potential attack surface | Use `torch.load(path, map_location=device, weights_only=True)` |
+| `get_train_transforms` in `predict_single` | Results non-deterministic (GaussianNoise, random flips) | Use `get_val_transforms` — always for inference |
+| `np.float32` values in result dict | `json.dumps(result)` raises `TypeError` | Wrap all values: `float(probs[i])` not `probs[i]` |
+| `torch.manual_seed()` at module level | Seed applied at import time, not at training start | Call inside `train()` as first line |
+| `bias=True` in Conv2d before BatchNorm | Extra parameters, redundant computation | `bias=False` whenever BatchNorm follows |
+| `validate_epoch` without `model.eval()` | Dropout active during validation → noisy val_acc | Always call `model.eval()` before the val loop |
+
+---
+
+*Phase 4 complete → proceed to Phase 5: CLI scripts (`scripts/train.py`, `scripts/evaluate.py`, `scripts/convert_binary.py`).*
