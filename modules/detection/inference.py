@@ -14,7 +14,12 @@ def load_model(
     device: torch.device = config.DEVICE,
 ) -> MalTwinCNN:
     """
-    Load a trained MalTwinCNN from a .pt file containing state_dict only.
+    Load a trained MalTwinCNN from a .pt file.
+
+    Handles the following saved formats automatically:
+        1. Raw state_dict (standard torch.save(model.state_dict(), path))
+        2. Checkpoint dict with 'model_state_dict' or 'state_dict' key
+        3. DataParallel-wrapped weights (module. prefix)
 
     Args:
         model_path:  path to best_model.pt
@@ -26,23 +31,104 @@ def load_model(
 
     Raises:
         FileNotFoundError: if model_path does not exist.
-
-    Notes:
-        - weights_only=True is the PyTorch 2.x secure loading flag.
-        - map_location=device handles CUDA-trained models on CPU-only machines.
+        RuntimeError:      if weights cannot be loaded after all recovery attempts,
+                           with a detailed diagnostic message.
     """
     if not model_path.exists():
         raise FileNotFoundError(
             f"Model file not found: {model_path}. "
             "Run scripts/train.py to train the model first."
         )
+
+    # ── 1. Load raw checkpoint ───────────────────────────────────────────────
+    raw = torch.load(str(model_path), map_location=device, weights_only=True)
+
+    # ── 2. Extract state_dict regardless of how it was saved ────────────────
+    if isinstance(raw, dict) and not _looks_like_state_dict(raw):
+        # Likely a full checkpoint dict — try common key names
+        for key in ("model_state_dict", "state_dict", "model"):
+            if key in raw:
+                state_dict = raw[key]
+                break
+        else:
+            # Fallback: assume it is the state_dict after all
+            state_dict = raw
+    else:
+        state_dict = raw
+
+    # ── 3. Strip DataParallel 'module.' prefix if present ───────────────────
+    if any(k.startswith("module.") for k in state_dict.keys()):
+        state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+
+    # ── 4. Build model ───────────────────────────────────────────────────────
     model = MalTwinCNN(num_classes=num_classes)
-    state_dict = torch.load(str(model_path), map_location=device, weights_only=True)
+
+    # ── 5. Diagnose mismatches before attempting strict load ─────────────────
+    model_keys = set(model.state_dict().keys())
+    ckpt_keys  = set(state_dict.keys())
+    missing    = model_keys - ckpt_keys
+    unexpected = ckpt_keys  - model_keys
+
+    if missing or unexpected:
+        # Try to infer the num_classes the checkpoint was trained with
+        ckpt_num_classes = _infer_num_classes(state_dict)
+        msg = (
+            f"\n[load_model] State dict mismatch detected.\n"
+            f"  model_path           : {model_path}\n"
+            f"  num_classes (passed) : {num_classes}\n"
+            f"  num_classes (ckpt)   : {ckpt_num_classes if ckpt_num_classes else 'unknown'}\n"
+            f"  Missing  keys ({len(missing)}): {missing}\n"
+            f"  Unexpected keys ({len(unexpected)}): {unexpected}\n"
+        )
+
+        if ckpt_num_classes and ckpt_num_classes != num_classes:
+            msg += (
+                f"\n  → num_classes mismatch is the likely cause.\n"
+                f"    Rebuilding model with num_classes={ckpt_num_classes} and retrying.\n"
+            )
+            # Rebuild with the correct num_classes and retry
+            model = MalTwinCNN(num_classes=ckpt_num_classes)
+            missing    = set(model.state_dict().keys()) - ckpt_keys
+            unexpected = ckpt_keys - set(model.state_dict().keys())
+            if not missing and not unexpected:
+                model.load_state_dict(state_dict)
+                model.to(device)
+                model.eval()
+                print(msg)  # still print so developer is aware
+                return model
+
+        raise RuntimeError(msg)
+
+    # ── 6. Strict load (clean path) ──────────────────────────────────────────
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
     return model
 
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _looks_like_state_dict(d: dict) -> bool:
+    """
+    Heuristic: a raw state_dict has tensor values.
+    A checkpoint dict typically has non-tensor values (epoch, loss, etc.).
+    """
+    return all(isinstance(v, torch.Tensor) for v in d.values())
+
+
+def _infer_num_classes(state_dict: dict) -> int | None:
+    """
+    Inspect the final Linear layer weight shape to recover num_classes.
+    MalTwinCNN's last layer key: 'classifier.4.weight' → shape (num_classes, 512)
+    """
+    # classifier is nn.Sequential; index 4 is the final Linear
+    for key in ("classifier.4.weight", "classifier.3.weight", "fc.weight"):
+        if key in state_dict:
+            return state_dict[key].shape[0]
+    return None
+
+
+# ── Inference ─────────────────────────────────────────────────────────────────
 
 def predict_single(
     model: MalTwinCNN,
@@ -171,4 +257,3 @@ def predict_batch(
                 })
 
     return results
-
