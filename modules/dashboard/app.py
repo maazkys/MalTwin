@@ -72,7 +72,7 @@ def load_global_resources() -> None:
     ):
         try:
             with st.spinner("Loading detection model…"):
-                num_classes = len(st.session_state[state.KEY_CLASS_NAMES])
+                num_classes = config.MALIMG_EXPECTED_FAMILIES
                 model = load_model(config.BEST_MODEL_PATH, num_classes, config.DEVICE)
                 st.session_state[state.KEY_MODEL]        = model
                 st.session_state[state.KEY_MODEL_LOADED] = True
@@ -157,4 +157,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
