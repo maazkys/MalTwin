@@ -149,13 +149,13 @@ def _render_history_section() -> None:
             )
 
         with col_f2:
-            min_conf = st.slider(
+            min_conf_pct = st.slider(
                 "Min Confidence",
-                min_value=0.0,
-                max_value=1.0,
-                value=0.0,
-                step=0.05,
-                format="%.0f%%",
+                min_value=0,
+                max_value=100,
+                value=0,
+                step=5,
+                format="%d%%",
                 key="history_min_conf",
             )
 
@@ -195,7 +195,7 @@ def _render_history_section() -> None:
     events = get_filtered_events(
         db_path=config.DB_PATH,
         family_filter=family_filter if family_filter != 'All Families' else None,
-        min_confidence=min_conf,
+        min_confidence=min_conf_pct / 100,
         days_back=days_back,
         limit=limit,
         sort_desc=sort_desc,

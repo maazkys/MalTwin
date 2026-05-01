@@ -76,7 +76,7 @@ def render():
     st.markdown(
         "Browse sample grayscale images from each malware family in the Malimg dataset. "
         "Each image is the raw byte structure of a malware binary visualised as a "
-        "128×128 greyscale image. Distinctive textures and patterns are visible per family."
+        "128×128 grayscale image. Distinctive textures and patterns are visible per family."
     )
     st.markdown("---")
 
@@ -218,11 +218,11 @@ def _render_image_grid(
     for row_start in range(0, len(images), n_cols):
         row_images = images[row_start:row_start + n_cols]
         cols = st.columns(n_cols)
-        for col, img_array in zip(cols, row_images):
+        for idx, (col, img_array) in enumerate(zip(cols, row_images)):
             with col:
                 st.image(
                     img_array,
-                    caption=f"{family_name} #{row_start + cols.index(col) + 1}",
+                    caption=f"{family_name} #{row_start + idx + 1}",
                     use_column_width=True,
                     clamp=True,
                 )
