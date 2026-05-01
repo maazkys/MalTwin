@@ -203,3 +203,91 @@ def get_events_by_date_range(db_path: Path, days_back: int = 7) -> list[dict]:
         return [dict(row) for row in rows]
     except Exception:
         return []
+
+
+def get_filtered_events(
+    db_path: Path,
+    family_filter: str | None = None,
+    min_confidence: float = 0.0,
+    days_back: int | None = None,
+    limit: int = 100,
+    sort_desc: bool = True,
+) -> list[dict]:
+    """
+    Return detection events with optional filtering and sorting.
+
+    Args:
+        db_path:        Path to SQLite database.
+        family_filter:  If not None and not 'All Families', filter by predicted_family.
+        min_confidence: Minimum confidence threshold (0.0 = no filter).
+        days_back:      If not None, only return events from last N days.
+        limit:          Maximum number of rows to return (default 100).
+        sort_desc:      If True, newest first. If False, oldest first.
+
+    Returns:
+        list[dict] — one dict per row, all schema columns present.
+        Empty list if DB does not exist or on any error.
+
+    Implementation:
+        Build WHERE clauses dynamically, always using ? placeholders.
+        Never use f-strings or % formatting in SQL.
+    """
+    if not db_path.exists():
+        return []
+    try:
+        clauses = []
+        params  = []
+
+        if family_filter and family_filter != 'All Families':
+            clauses.append('predicted_family = ?')
+            params.append(family_filter)
+
+        if min_confidence > 0.0:
+            clauses.append('confidence >= ?')
+            params.append(min_confidence)
+
+        if days_back is not None:
+            cutoff = (datetime.utcnow() - timedelta(days=days_back)).isoformat()
+            clauses.append('timestamp >= ?')
+            params.append(cutoff)
+
+        where = ('WHERE ' + ' AND '.join(clauses)) if clauses else ''
+        order = 'DESC' if sort_desc else 'ASC'
+        sql   = (
+            "SELECT * FROM detection_events "
+            + (where + " " if where else "")
+            + "ORDER BY id " + order + " "
+            + "LIMIT ?"
+        )
+        params.append(limit)
+
+        with get_connection(db_path) as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    except Exception:
+        return []
+
+
+def get_family_list(db_path: Path) -> list[str]:
+    """
+    Return a sorted list of all distinct malware families in the detection log,
+    with 'All Families' prepended as the default option.
+
+    Returns:
+        ['All Families', 'Allaple.A', 'Rbot!gen', ...]
+        ['All Families'] if DB is empty or does not exist.
+    """
+    if not db_path.exists():
+        return ['All Families']
+    try:
+        with get_connection(db_path) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT predicted_family "
+                "FROM detection_events "
+                "ORDER BY predicted_family ASC"
+            ).fetchall()
+        families = [row[0] for row in rows]
+        return ['All Families'] + families
+    except Exception:
+        return ['All Families']
