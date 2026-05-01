@@ -1,69 +1,227 @@
 {
+  "Adialer.C": {
+    "description": "Dialer trojan that establishes unauthorized premium-rate phone connections. Targets Windows systems.",
+    "tactics": ["Initial Access", "Execution", "Command and Control"],
+    "techniques": [
+      {"id": "T0866", "name": "Exploitation of Remote Services"},
+      {"id": "T0858", "name": "Change Operating Mode"},
+      {"id": "T0884", "name": "Connection Proxy"}
+    ]
+  },
+  "Agent.FYI": {
+    "description": "Remote access trojan providing backdoor access and data exfiltration capabilities.",
+    "tactics": ["Persistence", "Command and Control", "Collection"],
+    "techniques": [
+      {"id": "T0859", "name": "Valid Accounts"},
+      {"id": "T0884", "name": "Connection Proxy"},
+      {"id": "T0811", "name": "Data from Local System"}
+    ]
+  },
   "Allaple.A": {
-    "tactics": ["Lateral Movement", "Impact"],
+    "description": "Highly prevalent network worm with aggressive self-propagation via network shares and exploits.",
+    "tactics": ["Lateral Movement", "Discovery", "Command and Control"],
     "techniques": [
       {"id": "T0812", "name": "Default Credentials"},
-      {"id": "T0882", "name": "Theft of Operational Information"}
+      {"id": "T0840", "name": "Network Connection Enumeration"},
+      {"id": "T0885", "name": "Commonly Used Port"}
     ]
   },
   "Allaple.L": {
-    "tactics": ["Lateral Movement", "Discovery"],
+    "description": "Variant of the Allaple worm family with modified propagation and obfuscation techniques.",
+    "tactics": ["Lateral Movement", "Defense Evasion", "Command and Control"],
     "techniques": [
-      {"id": "T0846", "name": "Remote System Discovery"},
-      {"id": "T0812", "name": "Default Credentials"}
+      {"id": "T0812", "name": "Default Credentials"},
+      {"id": "T0858", "name": "Change Operating Mode"},
+      {"id": "T0884", "name": "Connection Proxy"}
     ]
   },
-  "Yuner.A": {
-    "tactics": ["Execution", "Persistence"],
+  "Alueron.gen!J": {
+    "description": "Generic detection for the Alueron rootkit family. Hides processes and network connections.",
+    "tactics": ["Defense Evasion", "Persistence", "Discovery"],
     "techniques": [
-      {"id": "T0807", "name": "Command-Line Interface"},
-      {"id": "T0839", "name": "Module Firmware"}
+      {"id": "T0820", "name": "Exploitation for Evasion"},
+      {"id": "T0839", "name": "Module Firmware"},
+      {"id": "T0842", "name": "Network Sniffing"}
+    ]
+  },
+  "Autorun.K": {
+    "description": "Worm spreading via removable media autorun functionality.",
+    "tactics": ["Initial Access", "Lateral Movement", "Execution"],
+    "techniques": [
+      {"id": "T0847", "name": "Replication Through Removable Media"},
+      {"id": "T0863", "name": "User Execution"},
+      {"id": "T0859", "name": "Valid Accounts"}
+    ]
+  },
+  "BrowseFox.B": {
+    "description": "Adware/browser hijacker that modifies browser settings and injects ads.",
+    "tactics": ["Execution", "Collection", "Command and Control"],
+    "techniques": [
+      {"id": "T0863", "name": "User Execution"},
+      {"id": "T0811", "name": "Data from Local System"},
+      {"id": "T0884", "name": "Connection Proxy"}
+    ]
+  },
+  "Dialplatform.B": {
+    "description": "Dialer platform malware that establishes covert outbound connections to premium services.",
+    "tactics": ["Command and Control", "Exfiltration", "Impact"],
+    "techniques": [
+      {"id": "T0884", "name": "Connection Proxy"},
+      {"id": "T0830", "name": "Adversary-in-the-Middle"},
+      {"id": "T0831", "name": "Manipulation of Control"}
+    ]
+  },
+  "Dontovo.A": {
+    "description": "Trojan dropper that installs additional malware components on infected systems.",
+    "tactics": ["Execution", "Persistence", "Defense Evasion"],
+    "techniques": [
+      {"id": "T0863", "name": "User Execution"},
+      {"id": "T0839", "name": "Module Firmware"},
+      {"id": "T0820", "name": "Exploitation for Evasion"}
+    ]
+  },
+  "Fakerean": {
+    "description": "Rogue security software displaying false alerts to extort payment from victims.",
+    "tactics": ["Impact", "Execution", "Command and Control"],
+    "techniques": [
+      {"id": "T0831", "name": "Manipulation of Control"},
+      {"id": "T0863", "name": "User Execution"},
+      {"id": "T0885", "name": "Commonly Used Port"}
     ]
   },
   "Instantaccess": {
-    "tactics": ["Collection"],
+    "description": "Adware that provides instant access to premium online content through unauthorized billing.",
+    "tactics": ["Execution", "Command and Control", "Impact"],
     "techniques": [
-      {"id": "T0802", "name": "Automated Collection"}
+      {"id": "T0863", "name": "User Execution"},
+      {"id": "T0884", "name": "Connection Proxy"},
+      {"id": "T0831", "name": "Manipulation of Control"}
     ]
   },
-  "Swizzor.gen!E": {
-    "tactics": ["Defense Evasion"],
+  "Lolyda.AA1": {
+    "description": "Password stealer targeting browser credentials, email clients, and FTP applications.",
+    "tactics": ["Credential Access", "Collection", "Exfiltration"],
     "techniques": [
-      {"id": "T0858", "name": "Change Operating Mode"}
+      {"id": "T0819", "name": "Exploit Public-Facing Application"},
+      {"id": "T0811", "name": "Data from Local System"},
+      {"id": "T0830", "name": "Adversary-in-the-Middle"}
     ]
   },
-  "VB.AT": {
-    "tactics": ["Execution"],
+  "Lolyda.AA2": {
+    "description": "Variant of Lolyda password stealer with enhanced credential harvesting.",
+    "tactics": ["Credential Access", "Collection", "Exfiltration"],
     "techniques": [
-      {"id": "T0871", "name": "Execution through API"}
+      {"id": "T0819", "name": "Exploit Public-Facing Application"},
+      {"id": "T0811", "name": "Data from Local System"},
+      {"id": "T0842", "name": "Network Sniffing"}
+    ]
+  },
+  "Lolyda.AA3": {
+    "description": "Third variant of Lolyda with added persistence and anti-analysis techniques.",
+    "tactics": ["Credential Access", "Persistence", "Defense Evasion"],
+    "techniques": [
+      {"id": "T0819", "name": "Exploit Public-Facing Application"},
+      {"id": "T0859", "name": "Valid Accounts"},
+      {"id": "T0820", "name": "Exploitation for Evasion"}
+    ]
+  },
+  "Lolyda.AT": {
+    "description": "Lolyda variant targeting AT-class systems with enhanced lateral movement.",
+    "tactics": ["Lateral Movement", "Credential Access", "Collection"],
+    "techniques": [
+      {"id": "T0866", "name": "Exploitation of Remote Services"},
+      {"id": "T0819", "name": "Exploit Public-Facing Application"},
+      {"id": "T0811", "name": "Data from Local System"}
+    ]
+  },
+  "Malex.gen!J": {
+    "description": "Generic Malex trojan with polymorphic code generation and rootkit capabilities.",
+    "tactics": ["Defense Evasion", "Persistence", "Command and Control"],
+    "techniques": [
+      {"id": "T0820", "name": "Exploitation for Evasion"},
+      {"id": "T0839", "name": "Module Firmware"},
+      {"id": "T0884", "name": "Connection Proxy"}
     ]
   },
   "Obfuscator.AD": {
-    "tactics": ["Defense Evasion"],
+    "description": "Obfuscated malware loader that decrypts and executes embedded payloads at runtime.",
+    "tactics": ["Defense Evasion", "Execution", "Persistence"],
     "techniques": [
-      {"id": "T0858", "name": "Change Operating Mode"},
-      {"id": "T0849", "name": "Masquerading"}
-    ]
-  },
-  "Adialer.C": {
-    "tactics": ["Impact", "Collection"],
-    "techniques": [
-      {"id": "T0879", "name": "Damage to Property"},
-      {"id": "T0802", "name": "Automated Collection"}
+      {"id": "T0820", "name": "Exploitation for Evasion"},
+      {"id": "T0863", "name": "User Execution"},
+      {"id": "T0839", "name": "Module Firmware"}
     ]
   },
   "Rbot!gen": {
-    "tactics": ["Command and Control", "Lateral Movement"],
+    "description": "IRC-controlled botnet client with DDoS, spam relay, and credential theft capabilities.",
+    "tactics": ["Command and Control", "Impact", "Lateral Movement"],
     "techniques": [
-      {"id": "T0869", "name": "Standard Application Layer Protocol"},
+      {"id": "T0885", "name": "Commonly Used Port"},
+      {"id": "T0814", "name": "Denial of Service"},
       {"id": "T0812", "name": "Default Credentials"}
     ]
   },
   "Skintrim.N": {
-    "tactics": ["Collection", "Exfiltration"],
+    "description": "Trojan that modifies system settings and installs additional malware components silently.",
+    "tactics": ["Persistence", "Defense Evasion", "Execution"],
     "techniques": [
-      {"id": "T0802", "name": "Automated Collection"},
+      {"id": "T0839", "name": "Module Firmware"},
+      {"id": "T0820", "name": "Exploitation for Evasion"},
+      {"id": "T0863", "name": "User Execution"}
+    ]
+  },
+  "Swizzor.gen!E": {
+    "description": "Polymorphic downloader that fetches and installs additional malware from remote servers.",
+    "tactics": ["Command and Control", "Execution", "Defense Evasion"],
+    "techniques": [
+      {"id": "T0884", "name": "Connection Proxy"},
+      {"id": "T0863", "name": "User Execution"},
+      {"id": "T0820", "name": "Exploitation for Evasion"}
+    ]
+  },
+  "Swizzor.gen!I": {
+    "description": "Variant of Swizzor downloader with improved anti-analysis and traffic encryption.",
+    "tactics": ["Command and Control", "Defense Evasion", "Execution"],
+    "techniques": [
+      {"id": "T0884", "name": "Connection Proxy"},
+      {"id": "T0820", "name": "Exploitation for Evasion"},
+      {"id": "T0858", "name": "Change Operating Mode"}
+    ]
+  },
+  "VB.AT": {
+    "description": "Visual Basic-compiled trojan with keylogging and remote shell capabilities.",
+    "tactics": ["Collection", "Command and Control", "Exfiltration"],
+    "techniques": [
+      {"id": "T0811", "name": "Data from Local System"},
+      {"id": "T0885", "name": "Commonly Used Port"},
       {"id": "T0830", "name": "Adversary-in-the-Middle"}
+    ]
+  },
+  "Wintrim.BX": {
+    "description": "Trimmer malware that strips system protections and installs persistent backdoors.",
+    "tactics": ["Defense Evasion", "Persistence", "Impact"],
+    "techniques": [
+      {"id": "T0820", "name": "Exploitation for Evasion"},
+      {"id": "T0839", "name": "Module Firmware"},
+      {"id": "T0831", "name": "Manipulation of Control"}
+    ]
+  },
+  "Yuner.A": {
+    "description": "Worm with fast self-replication via network drives and email attachment propagation.",
+    "tactics": ["Lateral Movement", "Initial Access", "Execution"],
+    "techniques": [
+      {"id": "T0847", "name": "Replication Through Removable Media"},
+      {"id": "T0866", "name": "Exploitation of Remote Services"},
+      {"id": "T0863", "name": "User Execution"}
+    ]
+  },
+  "Zlob.gen!D": {
+    "description": "Generic Zlob downloader variant. Poses as a media codec, downloads additional payloads.",
+    "tactics": ["Initial Access", "Execution", "Command and Control"],
+    "techniques": [
+      {"id": "T0863", "name": "User Execution"},
+      {"id": "T0866", "name": "Exploitation of Remote Services"},
+      {"id": "T0884", "name": "Connection Proxy"}
     ]
   }
 }

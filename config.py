@@ -46,12 +46,12 @@ NUM_WORKERS  = int(os.getenv("MALTWIN_NUM_WORKERS",    "4"))
 TRAIN_RATIO = float(os.getenv("MALTWIN_TRAIN_RATIO", "0.70"))
 VAL_RATIO   = float(os.getenv("MALTWIN_VAL_RATIO",   "0.15"))
 TEST_RATIO  = float(os.getenv("MALTWIN_TEST_RATIO",  "0.15"))
-assert abs(TRAIN_RATIO + VAL_RATIO + TEST_RATIO - 1.0) < 1e-6, 
+assert abs(TRAIN_RATIO + VAL_RATIO + TEST_RATIO - 1.0) < 1e-6, \
     "MALTWIN_TRAIN_RATIO + MALTWIN_VAL_RATIO + MALTWIN_TEST_RATIO must equal 1.0"
 
 # ── Oversampler ───────────────────────────────────────────────────────────────
 OVERSAMPLE_STRATEGY = os.getenv("MALTWIN_OVERSAMPLE_STRATEGY", "oversample_minority")
-assert OVERSAMPLE_STRATEGY in {"oversample_minority", "sqrt_inverse", "uniform"}, 
+assert OVERSAMPLE_STRATEGY in {"oversample_minority", "sqrt_inverse", "uniform"}, \
     f"MALTWIN_OVERSAMPLE_STRATEGY must be one of: oversample_minority, sqrt_inverse, uniform"
 
 # ── Reproducibility ───────────────────────────────────────────────────────────

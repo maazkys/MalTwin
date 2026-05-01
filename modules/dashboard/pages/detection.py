@@ -295,49 +295,101 @@ def _render_results() -> None:
     if state.has_heatmap():
         _render_heatmap()
 
-    # ── F: Report Export ──────────────────────────────────────────────────────
+    # ── F: Forensic Report Export ─────────────────────────────────────────────
     st.subheader("Forensic Report")
+
+    report_data = _build_report_data()
+
     col_pdf, col_json = st.columns(2)
 
     with col_pdf:
-        st.button(
-            "📄 Download PDF Report (Coming Soon)",
-            disabled=True,
-            help="Automated PDF forensic report generation will be available in Module 8.",
+        if st.button(
+            "📄 Generate PDF Report",
+            type="secondary",
             use_container_width=True,
-        )
+            help="Generate a PDF forensic report with MITRE ATT&CK mapping "
+                 "and Grad-CAM heatmap (if generated).",
+        ):
+            with st.spinner("Generating PDF report…"):
+                from modules.reporting.pdf_report import generate_pdf_report
+                pdf_bytes = generate_pdf_report(report_data)
+
+            if pdf_bytes is None:
+                st.error(
+                    "Error: PDF generation failed. "
+                    "Cause: fpdf2 error or missing dependency. "
+                    "Action: Use the JSON download instead."
+                )
+            else:
+                meta = st.session_state[state.KEY_FILE_META]
+                st.download_button(
+                    label="📥 Download PDF Report",
+                    data=pdf_bytes,
+                    file_name=f"maltwin_report_{meta['sha256'][:8]}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
 
     with col_json:
+        from modules.reporting.json_report import generate_json_report
+        json_bytes = generate_json_report(report_data)
         meta = st.session_state[state.KEY_FILE_META]
-        export_data = {
-            'file_name':         meta['name'],
-            'sha256':            meta['sha256'],
-            'file_format':       meta['format'],
-            'file_size_bytes':   meta['size_bytes'],
-            'upload_time':       meta['upload_time'],
-            'predicted_family':  result['predicted_family'],
-            'confidence':        result['confidence'],
-            'top3':              result['top3'],
-            'all_probabilities': result['probabilities'],
-        }
-        # Add GradCAM audit info if heatmap was generated
-        if state.has_heatmap():
-            heatmap_data = st.session_state[state.KEY_HEATMAP]
-            export_data['gradcam'] = {
-                'generated': True,
-                'target_class': heatmap_data['target_class'],
-                'layer': heatmap_data['captum_layer'],
-            }
-        else:
-            export_data['gradcam'] = {'generated': False}
-        json_bytes = json.dumps(export_data, indent=2).encode('utf-8')
         st.download_button(
-            label="📥 Download JSON Result",
+            label="📥 Download JSON Report",
             data=json_bytes,
-            file_name=f"maltwin_result_{meta['sha256'][:8]}.json",
+            file_name=f"maltwin_report_{meta['sha256'][:8]}.json",
             mime="application/json",
             use_container_width=True,
+            help="Full structured JSON report with MITRE ATT&CK mapping and detection metadata.",
         )
+
+    if state.has_heatmap():
+        st.caption(
+            "✅ Grad-CAM heatmap will be embedded in the PDF report. "
+            "Generate the heatmap above first if you haven't already."
+        )
+    else:
+        st.caption(
+            "💡 Tip: Generate the Grad-CAM heatmap above to embed it in the PDF report."
+        )
+
+
+def _build_report_data() -> dict:
+    """
+    Assemble the complete report_data dict from session state.
+    Used by both PDF and JSON report generators.
+    Called only when a detection result exists.
+    """
+    from modules.reporting.mitre_mapper import get_mitre_mapping
+
+    result    = st.session_state[state.KEY_DETECTION]
+    meta      = st.session_state[state.KEY_FILE_META]
+    heatmap   = st.session_state.get(state.KEY_HEATMAP)
+
+    mitre_data = get_mitre_mapping(result['predicted_family'])
+
+    gradcam_info = {'generated': False}
+    if heatmap is not None:
+        gradcam_info = {
+            'generated':         True,
+            'target_class':      heatmap['target_class'],
+            'layer':             heatmap['captum_layer'],
+            'overlay_png_bytes': heatmap['overlay_png'],   # bytes for PDF embedding
+        }
+
+    return {
+        'file_name':        meta['name'],
+        'sha256':           meta['sha256'],
+        'file_format':      meta['format'],
+        'file_size_bytes':  meta['size_bytes'],
+        'upload_time':      meta['upload_time'],
+        'predicted_family': result['predicted_family'],
+        'confidence':       float(result['confidence']),
+        'top3':             result['top3'],
+        'all_probabilities': result['probabilities'],
+        'gradcam':          gradcam_info,
+        'mitre':            mitre_data,
+    }
 
 
 def _render_probability_chart(probabilities: dict) -> None:
