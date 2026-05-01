@@ -173,7 +173,7 @@ def generate_pdf_report(report_data: dict) -> bytes | None:
 
         # ── Page 2: MITRE ATT&CK for ICS ─────────────────────────────────────
         pdf.add_page()
-        pdf.section_title('MITRE ATT\u0026CK for ICS Mapping')
+        pdf.section_title('MITRE ATT&CK for ICS Mapping')
         mitre = report_data.get('mitre', {})
 
         if not mitre.get('found', False):
