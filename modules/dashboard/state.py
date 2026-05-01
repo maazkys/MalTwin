@@ -15,6 +15,7 @@ KEY_FILE_META    = 'file_meta'         # dict from get_file_metadata() or None
 KEY_DETECTION    = 'detection_result'  # dict from predict_single() or None
 KEY_MODEL_LOADED = 'model_loaded'      # bool
 KEY_DEVICE_INFO  = 'device_info'       # str e.g. "cuda:0" or "cpu"
+KEY_HEATMAP      = 'gradcam_heatmap'   # dict from generate_gradcam() or None
 
 
 def init_session_state() -> None:
@@ -30,6 +31,7 @@ def init_session_state() -> None:
         KEY_DETECTION:    None,
         KEY_MODEL_LOADED: False,
         KEY_DEVICE_INFO:  'unknown',
+        KEY_HEATMAP:      None,
     }
     for key, default in defaults.items():
         if key not in st.session_state:
@@ -44,6 +46,7 @@ def clear_file_state() -> None:
     st.session_state[KEY_IMG_ARRAY] = None
     st.session_state[KEY_FILE_META] = None
     st.session_state[KEY_DETECTION] = None
+    st.session_state[KEY_HEATMAP] = None
 
 
 def has_uploaded_file() -> bool:
@@ -56,3 +59,7 @@ def has_detection_result() -> bool:
 
 def is_model_loaded() -> bool:
     return st.session_state.get(KEY_MODEL_LOADED, False)
+
+
+def has_heatmap() -> bool:
+    return st.session_state.get(KEY_HEATMAP) is not None
