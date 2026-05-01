@@ -113,6 +113,94 @@ def _run_detection() -> None:
         )
 
 
+def _run_gradcam() -> None:
+    """
+    Generate Grad-CAM heatmap for the current detection result.
+    Stores result in session_state[KEY_HEATMAP].
+    Never raises — generate_gradcam() handles all exceptions internally.
+    """
+    if state.has_heatmap():
+        return  # Already generated for this detection — don't regenerate
+
+    result = st.session_state.get(state.KEY_DETECTION)
+    if result is None:
+        st.warning("Run detection first before generating the heatmap.")
+        return
+
+    model = st.session_state[state.KEY_MODEL]
+    class_names = st.session_state[state.KEY_CLASS_NAMES]
+    img_array = st.session_state[state.KEY_IMG_ARRAY]
+    target_class = class_names.index(result['predicted_family'])
+
+    with st.spinner("Generating Grad-CAM heatmap… (this may take a few seconds)"):
+        from modules.detection.gradcam import generate_gradcam
+
+        heatmap_data = generate_gradcam(model, img_array, target_class, config.DEVICE)
+
+    if heatmap_data is None:
+        st.error(
+            "Error: Heatmap generation failed. "
+            "Cause: Captum backward pass error or incompatible model state. "
+            "Action: Ensure the model was loaded correctly and try again."
+        )
+        return
+
+    st.session_state[state.KEY_HEATMAP] = heatmap_data
+    st.rerun()  # Rerun to render heatmap section below
+
+
+def _render_heatmap() -> None:
+    """
+    Display the Grad-CAM heatmap results: overlay + standalone heatmap side by side.
+    Also provides a download button for the overlay PNG (used in M8 reports).
+    """
+    heatmap_data = st.session_state[state.KEY_HEATMAP]
+    result = st.session_state[state.KEY_DETECTION]
+
+    col_overlay, col_heatmap = st.columns(2)
+
+    with col_overlay:
+        st.markdown("**Heatmap Overlay** — warm regions drove the prediction")
+        st.image(
+            heatmap_data['overlay_png'],
+            caption=(
+                f"Grad-CAM overlay for predicted class: "
+                f"{result['predicted_family']} "
+                f"({result['confidence']*100:.1f}% confidence)"
+            ),
+            use_container_width=True,
+        )
+
+    with col_heatmap:
+        st.markdown("**Raw Attribution Map** — with colorbar")
+        st.image(
+            heatmap_data['heatmap_only_png'],
+            caption="Jet colormap: red = high attribution, blue = low attribution",
+            use_container_width=True,
+        )
+
+    # Interpretation text (SRS M7 FE-3)
+    st.markdown("**Interpretation:**")
+    st.info(
+        "🔴 **Red/warm regions** — byte offsets in these areas of the binary "
+        "were the strongest signals for the predicted classification. "
+        "These regions often correspond to code sections with distinctive "
+        "structural patterns (entry points, encrypted payloads, PE headers). "
+        "\n\n"
+        "🔵 **Blue/cool regions** — these byte regions had low influence "
+        "on the classification decision."
+    )
+
+    # Export button for heatmap overlay (feeds into M8 PDF report)
+    st.download_button(
+        label="📥 Download Heatmap Overlay PNG",
+        data=heatmap_data['overlay_png'],
+        file_name=f"gradcam_{result['predicted_family'].replace('.', '_')}.png",
+        mime="image/png",
+        help="Download the Grad-CAM heatmap overlay for inclusion in forensic reports.",
+    )
+
+
 def _render_results() -> None:
     """
     Render the full detection results panel.
@@ -183,20 +271,29 @@ def _render_results() -> None:
 
     st.markdown("---")
 
-    # ── E: XAI Heatmap (STUB) ────────────────────────────────────────────────
+    # ── E: XAI Heatmap ────────────────────────────────────────────────────────
     st.subheader("Explainable AI — Grad-CAM Heatmap")
-    xai_requested = st.checkbox(
-        "Generate Grad-CAM Heatmap",
+    st.caption(
+        "Highlights which byte regions of the binary image drove the classification decision.",
         help=(
-            "Grad-CAM highlights which regions of the binary image influenced "
-            "the classification decision."
+            "Grad-CAM (Gradient-weighted Class Activation Mapping) uses gradients "
+            "flowing into the final convolutional layer to produce a heatmap. "
+            "Red/warm regions contributed most strongly to the predicted class."
         ),
     )
+
+    xai_requested = st.checkbox(
+        "Generate Grad-CAM Heatmap",
+        key="xai_checkbox",
+        help="Generates a heatmap showing which byte regions drove the detection. "
+             "Adds ~2–8 seconds depending on hardware.",
+    )
+
     if xai_requested:
-        st.info(
-            "🔬 Grad-CAM XAI visualization will be implemented in Module 7. "
-            "This feature generates heatmaps showing which byte regions drove the classification."
-        )
+        _run_gradcam()
+
+    if state.has_heatmap():
+        _render_heatmap()
 
     # ── F: Report Export ──────────────────────────────────────────────────────
     st.subheader("Forensic Report")
@@ -223,6 +320,16 @@ def _render_results() -> None:
             'top3':              result['top3'],
             'all_probabilities': result['probabilities'],
         }
+        # Add GradCAM audit info if heatmap was generated
+        if state.has_heatmap():
+            heatmap_data = st.session_state[state.KEY_HEATMAP]
+            export_data['gradcam'] = {
+                'generated': True,
+                'target_class': heatmap_data['target_class'],
+                'layer': heatmap_data['captum_layer'],
+            }
+        else:
+            export_data['gradcam'] = {'generated': False}
         json_bytes = json.dumps(export_data, indent=2).encode('utf-8')
         st.download_button(
             label="📥 Download JSON Result",
@@ -294,4 +401,3 @@ def _render_mitre_mapping(predicted_family: str) -> None:
         st.markdown("**Techniques:**")
         for t in techniques:
             st.markdown(f"  - `{t['id']}` — {t['name']}")
-
