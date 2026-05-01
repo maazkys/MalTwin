@@ -95,6 +95,7 @@ def render_sidebar() -> str:
             "🏠 Dashboard",
             "📂 Binary Upload",
             "🔍 Malware Detection",
+            "🖼️ Dataset Gallery",
             "🖥️ Digital Twin",
         ],
         label_visibility="hidden",
@@ -149,6 +150,9 @@ def main() -> None:
         render()
     elif page == "🔍 Malware Detection":
         from modules.dashboard.pages.detection import render
+        render()
+    elif page == "🖼️ Dataset Gallery":
+        from modules.dashboard.pages.gallery import render
         render()
     elif page == "🖥️ Digital Twin":
         from modules.dashboard.pages.digital_twin import render

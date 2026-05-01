@@ -12,7 +12,6 @@ from collections import defaultdict
 
 import config
 from modules.dashboard.db import (
-    get_recent_events,
     get_detection_stats,
     get_events_by_date_range,
 )
@@ -58,18 +57,9 @@ def render():
 
     st.markdown("---")
 
-    # ── Recent Detection Feed ─────────────────────────────────────────────────
-    st.subheader("Recent Detections")
-    events = get_recent_events(config.DB_PATH, limit=5)
-    if not events:
-        st.caption("No detections yet. Upload a binary file to get started.")
-    else:
-        df = pd.DataFrame(events)[
-            ['timestamp', 'file_name', 'predicted_family', 'confidence', 'device_used']
-        ]
-        df['confidence'] = df['confidence'].apply(lambda x: f"{x * 100:.1f}%")
-        df.columns = ['Timestamp', 'File', 'Predicted Family', 'Confidence', 'Device']
-        st.dataframe(df, use_container_width=True, hide_index=True)
+    # ── Recent Detection Feed (with filters) ──────────────────────────────────
+    st.subheader("Detection History")
+    _render_history_section()
 
     st.markdown("---")
 
@@ -136,3 +126,128 @@ def _render_module_status():
     df = pd.DataFrame(modules, columns=["ID", "Module", "Status"])
     st.dataframe(df, use_container_width=True, hide_index=True)
 
+
+def _render_history_section() -> None:
+    """
+    Filterable, sortable detection history table.
+    SRS refs: FR1.4, M8 FE-5
+    """
+    import pandas as pd
+    from modules.dashboard.db import get_filtered_events, get_family_list
+
+    # ── Filter controls ───────────────────────────────────────────────────────
+    with st.expander("🔍 Filter & Sort", expanded=False):
+        col_f1, col_f2, col_f3, col_f4 = st.columns(4)
+
+        with col_f1:
+            family_options = get_family_list(config.DB_PATH)
+            family_filter = st.selectbox(
+                "Malware Family",
+                options=family_options,
+                index=0,
+                key="history_family_filter",
+            )
+
+        with col_f2:
+            min_conf = st.slider(
+                "Min Confidence",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.0,
+                step=0.05,
+                format="%.0f%%",
+                key="history_min_conf",
+            )
+
+        with col_f3:
+            days_options = {
+                "All time":    None,
+                "Last 7 days":  7,
+                "Last 30 days": 30,
+                "Last 90 days": 90,
+            }
+            days_label = st.selectbox(
+                "Time Range",
+                options=list(days_options.keys()),
+                index=0,
+                key="history_days",
+            )
+            days_back = days_options[days_label]
+
+        with col_f4:
+            sort_desc = st.radio(
+                "Sort Order",
+                options=["Newest first", "Oldest first"],
+                index=0,
+                key="history_sort",
+            ) == "Newest first"
+
+        limit = st.slider(
+            "Max rows",
+            min_value=10,
+            max_value=500,
+            value=50,
+            step=10,
+            key="history_limit",
+        )
+
+    # ── Fetch events ──────────────────────────────────────────────────────────
+    events = get_filtered_events(
+        db_path=config.DB_PATH,
+        family_filter=family_filter if family_filter != 'All Families' else None,
+        min_confidence=min_conf,
+        days_back=days_back,
+        limit=limit,
+        sort_desc=sort_desc,
+    )
+
+    if not events:
+        st.caption(
+            "No detections match the current filters. "
+            "Upload a binary file on the Binary Upload page to get started."
+        )
+        return
+
+    # ── Build display dataframe ───────────────────────────────────────────────
+    df = pd.DataFrame(events)
+
+    df['confidence_pct'] = df['confidence'].apply(lambda x: f"{x * 100:.1f}%")
+    df['timestamp']      = pd.to_datetime(df['timestamp']).dt.strftime('%Y-%m-%d %H:%M:%S')
+
+    display_df = df[[
+        'timestamp', 'file_name', 'predicted_family',
+        'confidence_pct', 'file_format', 'device_used',
+    ]].copy()
+    display_df.columns = [
+        'Timestamp', 'File', 'Predicted Family',
+        'Confidence', 'Format', 'Device',
+    ]
+
+    # ── Summary metrics ───────────────────────────────────────────────────────
+    col_m1, col_m2, col_m3 = st.columns(3)
+    col_m1.metric("Rows shown", len(events))
+    col_m2.metric(
+        "Avg confidence",
+        f"{df['confidence'].mean() * 100:.1f}%",
+    )
+    col_m3.metric(
+        "Unique families",
+        df['predicted_family'].nunique(),
+    )
+
+    # ── Table ─────────────────────────────────────────────────────────────────
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # ── CSV export ────────────────────────────────────────────────────────────
+    csv_bytes = display_df.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="📥 Export to CSV",
+        data=csv_bytes,
+        file_name="maltwin_detection_history.csv",
+        mime="text/csv",
+        help="Download the filtered detection history as a CSV file.",
+    )
