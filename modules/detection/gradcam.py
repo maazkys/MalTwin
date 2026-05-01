@@ -196,5 +196,4 @@ def _heatmap_to_png(heatmap_array: np.ndarray) -> bytes:
         buf.seek(0)
         return buf.getvalue()
     finally:
-        buf.close()
         plt.close(fig)  # mandatory — prevent memory leak
