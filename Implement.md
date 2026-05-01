@@ -1,9 +1,9 @@
-# MalTwin — Implementation Step 2: M8 Automated Forensic Reporting
-### SRS refs: FR5.6, FR-B4, UC-03, M8 FE-1 through FE-5
+# MalTwin — Implementation Step 3: Dataset Gallery + Detection History Filtering
+### SRS refs: FR1.4, M6 FE-5, M8 FE-5
 
-> Complete Step 1 (Grad-CAM) and verify `pytest tests/test_gradcam.py -v` passes
-> before starting this step. The PDF pipeline embeds the heatmap overlay PNG
-> produced by Step 1 — it depends on `generate_gradcam` being correct.
+> Complete Steps 1 and 2 first. This step has no dependency on Grad-CAM or
+> the reporting pipeline, but the full regression suite must be green before
+> starting here.
 
 ---
 
@@ -11,1173 +11,798 @@
 
 | Item | Status before | Status after |
 |---|---|---|
-| `modules/reporting/__init__.py` | Does not exist | Package exports |
-| `modules/reporting/pdf_report.py` | Does not exist | Full FPDF2 PDF generator |
-| `modules/reporting/json_report.py` | Does not exist | Structured JSON report builder |
-| `modules/reporting/mitre_mapper.py` | Does not exist | MITRE lookup + full 25-family seed |
-| `data/mitre_ics_mapping.json` | Partial / missing families | All 25 Malimg families mapped |
-| `modules/dashboard/pages/detection.py` | PDF button disabled, JSON minimal | Both buttons active, full report pipeline |
-| `tests/test_reporting.py` | Does not exist | Full test suite |
+| `modules/dashboard/pages/gallery.py` | Does not exist | Full dataset gallery page |
+| `modules/dashboard/app.py` | 4-page routing | 5-page routing with gallery |
+| `modules/dashboard/pages/home.py` | Last-5 events, no filter | Filterable history table + expanded query |
+| `modules/dashboard/db.py` | `get_recent_events(limit=5)` only | `get_filtered_events()` + `get_family_list()` added |
+| `tests/test_gallery.py` | Does not exist | Gallery unit tests |
+| `tests/test_db.py` | Existing suite | `TestGetFilteredEvents` + `TestGetFamilyList` added |
 
 ---
 
 ## Mandatory Rules
 
-- **FPDF2** (`fpdf2` package, imported as `from fpdf import FPDF`) — not the older `fpdf` package. The API differs.
-- PDF generation **never raises** — all exceptions caught, fallback to JSON communicated to caller.
-- `mitre_mapper.py` reads from `config.MITRE_JSON_PATH` — never hardcodes the path.
-- The MITRE JSON file uses family name as key, exactly matching the `class_names` strings from training.
-- PDF embeds the Grad-CAM overlay PNG **only if** `heatmap_data` is not None — gracefully skips if XAI was not generated.
-- All `generate_*` functions accept a `report_data` dict assembled by the dashboard — they do not reach into `st.session_state` directly.
-- JSON report values must all be JSON-serialisable — no numpy types, no PIL objects.
-- `save_report()` creates `config.REPORTS_DIR` if it does not exist.
-- Report filenames are based on the first 8 chars of SHA-256 to avoid collisions.
+- The gallery page loads images **directly from `config.DATA_DIR`** using `pathlib.Path` — it never calls a DataLoader or imports PyTorch.
+- Images are loaded with `PIL.Image.open()` in mode `'L'` then displayed via `st.image()`.
+- The gallery renders a **grid of columns** using `st.columns()` — never a single-column list.
+- Gallery page gracefully handles missing dataset: shows an info message, never crashes.
+- `get_filtered_events()` uses **parameterised SQL** only — no string formatting into queries.
+- All new DB functions return empty list on any error — never raise.
+- `get_family_list()` returns families sorted alphabetically, with `"All Families"` prepended.
+- Detection history filter state lives in `st.session_state` — not URL params.
+- The gallery and history pages use `@st.cache_data` with a `ttl` for expensive disk reads.
+- No new session_state keys are needed — history filters are local widget state.
 
 ---
 
-## New config entries needed
+## File 1: Add two functions to `modules/dashboard/db.py`
 
-Add these to `config.py` if not already present:
+Add these functions at the bottom of the existing `db.py`. Do not modify any existing functions.
 
 ```python
-# config.py additions
-REPORTS_DIR   = BASE_DIR / 'data' / 'reports'
-REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+def get_filtered_events(
+    db_path: Path,
+    family_filter: str | None = None,
+    min_confidence: float = 0.0,
+    days_back: int | None = None,
+    limit: int = 100,
+    sort_desc: bool = True,
+) -> list[dict]:
+    """
+    Return detection events with optional filtering and sorting.
+
+    Args:
+        db_path:        Path to SQLite database.
+        family_filter:  If not None and not 'All Families', filter by predicted_family.
+        min_confidence: Minimum confidence threshold (0.0 = no filter).
+        days_back:      If not None, only return events from last N days.
+        limit:          Maximum number of rows to return (default 100).
+        sort_desc:      If True, newest first. If False, oldest first.
+
+    Returns:
+        list[dict] — one dict per row, all schema columns present.
+        Empty list if DB does not exist or on any error.
+
+    Implementation:
+        Build WHERE clauses dynamically, always using ? placeholders.
+        Never use f-strings or % formatting in SQL.
+    """
+    if not db_path.exists():
+        return []
+    try:
+        clauses = []
+        params  = []
+
+        if family_filter and family_filter != 'All Families':
+            clauses.append('predicted_family = ?')
+            params.append(family_filter)
+
+        if min_confidence > 0.0:
+            clauses.append('confidence >= ?')
+            params.append(min_confidence)
+
+        if days_back is not None:
+            from datetime import datetime, timedelta
+            cutoff = (datetime.utcnow() - timedelta(days=days_back)).isoformat()
+            clauses.append('timestamp >= ?')
+            params.append(cutoff)
+
+        where = ('WHERE ' + ' AND '.join(clauses)) if clauses else ''
+        order = 'DESC' if sort_desc else 'ASC'
+        sql   = (
+            f"SELECT * FROM detection_events "
+            f"{where} "
+            f"ORDER BY id {order} "
+            f"LIMIT ?"
+        )
+        params.append(limit)
+
+        with get_connection(db_path) as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    except Exception:
+        return []
+
+
+def get_family_list(db_path: Path) -> list[str]:
+    """
+    Return a sorted list of all distinct malware families in the detection log,
+    with 'All Families' prepended as the default option.
+
+    Returns:
+        ['All Families', 'Allaple.A', 'Rbot!gen', ...]
+        ['All Families'] if DB is empty or does not exist.
+    """
+    if not db_path.exists():
+        return ['All Families']
+    try:
+        with get_connection(db_path) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT predicted_family "
+                "FROM detection_events "
+                "ORDER BY predicted_family ASC"
+            ).fetchall()
+        families = [row[0] for row in rows]
+        return ['All Families'] + families
+    except Exception:
+        return ['All Families']
 ```
 
-`MITRE_JSON_PATH` and `PROCESSED_DIR` should already exist from Phase 6.
-
 ---
 
-## File 1: `modules/reporting/__init__.py`
+## File 2: `modules/dashboard/pages/gallery.py`
 
 ```python
-# modules/reporting/__init__.py
-from .pdf_report import generate_pdf_report
-from .json_report import generate_json_report
-from .mitre_mapper import get_mitre_mapping, load_mitre_db
-```
-
----
-
-## File 2: `modules/reporting/mitre_mapper.py`
-
-```python
-# modules/reporting/mitre_mapper.py
+# modules/dashboard/pages/gallery.py
 """
-MITRE ATT&CK for ICS mapping loader and query helper.
+Dataset Gallery page — per-family sample image grid.
 
-Reads from config.MITRE_JSON_PATH (data/mitre_ics_mapping.json).
-Never raises — returns empty dict on any failure.
+SRS refs: M6 FE-5
+Displays sample grayscale images from each of the 25 Malimg malware families
+directly from config.DATA_DIR. No PyTorch or DataLoader involved.
 
-JSON schema expected:
-{
-  "FamilyName": {
-    "tactics":    ["Initial Access", "Execution", ...],
-    "techniques": [
-      {"id": "T0817", "name": "Drive-by Compromise"},
-      ...
-    ],
-    "description": "Brief family description for the PDF report."
-  },
-  ...
-}
+Layout:
+    - Sidebar family selector (radio or selectbox)
+    - Main area: family info header + NxM image grid
+    - Grid columns configurable via a slider (default 4)
+    - Max images per family configurable (default 12)
 """
-import json
-import sys
+import streamlit as st
 from pathlib import Path
+from PIL import Image
+import numpy as np
+
 import config
 
 
-def load_mitre_db(path: Path = config.MITRE_JSON_PATH) -> dict:
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_family_names(data_dir: str) -> list[str]:
     """
-    Load the full MITRE mapping database from JSON.
-    Returns empty dict on FileNotFoundError or parse error.
+    Scan data_dir for subdirectory names (one per family).
+    Cached for 5 minutes — avoids repeated disk scans.
+    Returns sorted list of family name strings.
+    Returns [] if data_dir does not exist.
     """
+    path = Path(data_dir)
+    if not path.exists():
+        return []
+    return sorted([p.name for p in path.iterdir() if p.is_dir()])
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_sample_images(
+    data_dir: str,
+    family_name: str,
+    max_images: int = 12,
+) -> list[np.ndarray]:
+    """
+    Load up to max_images PNG images from data_dir/family_name/.
+    Returns list of uint8 numpy arrays shape (H, W).
+    Returns [] if directory is missing or has no PNGs.
+    Cached per (data_dir, family_name, max_images).
+    """
+    family_dir = Path(data_dir) / family_name
+    if not family_dir.exists():
+        return []
+
+    png_files = sorted(list(family_dir.glob('*.png')) + list(family_dir.glob('*.PNG')))
+    png_files = png_files[:max_images]
+
+    images = []
+    for path in png_files:
+        try:
+            img = Image.open(path).convert('L')      # grayscale
+            images.append(np.array(img))
+        except Exception:
+            continue   # skip corrupt files silently
+    return images
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _count_family_images(data_dir: str, family_name: str) -> int:
+    """Return total PNG count for a family (not capped at max_images)."""
+    family_dir = Path(data_dir) / family_name
+    if not family_dir.exists():
+        return 0
+    return len(list(family_dir.glob('*.png')) + list(family_dir.glob('*.PNG')))
+
+
+def render():
+    st.title("🖼️ Dataset Gallery")
+    st.markdown(
+        "Browse sample grayscale images from each malware family in the Malimg dataset. "
+        "Each image is the raw byte structure of a malware binary visualised as a "
+        "128×128 greyscale image. Distinctive textures and patterns are visible per family."
+    )
+    st.markdown("---")
+
+    # ── Dataset availability check ────────────────────────────────────────────
+    family_names = _load_family_names(str(config.DATA_DIR))
+
+    if not family_names:
+        st.info(
+            "📂 Dataset not found. "
+            f"The Malimg dataset was not detected at `{config.DATA_DIR}`. "
+            "Download it from Kaggle and extract it so that each malware family "
+            "has its own subfolder under `data/malimg/`."
+        )
+        st.markdown("**Expected structure:**")
+        st.code(
+            "data/malimg/\n"
+            "├── Allaple.A/\n"
+            "│   ├── 00a5c6a6.png\n"
+            "│   └── ...\n"
+            "├── Rbot!gen/\n"
+            "└── ...",
+            language=None,
+        )
+        return
+
+    # ── Controls sidebar ──────────────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown("### 🖼️ Gallery Controls")
+        st.divider()
+
+        selected_family = st.selectbox(
+            "Malware Family",
+            options=family_names,
+            index=0,
+            help="Select a malware family to view sample images.",
+        )
+
+        max_images = st.slider(
+            "Max images to show",
+            min_value=4,
+            max_value=24,
+            value=12,
+            step=4,
+            help="Maximum number of sample images displayed per family.",
+        )
+
+        n_cols = st.slider(
+            "Grid columns",
+            min_value=2,
+            max_value=6,
+            value=4,
+            help="Number of columns in the image grid.",
+        )
+
+        st.divider()
+        st.markdown(f"**{len(family_names)} families** in dataset")
+
+    # ── Family overview strip (all families mini-preview) ─────────────────────
+    st.subheader("All Families — Quick Overview")
+    st.caption(
+        "One representative image per family. Click the family selector in the sidebar "
+        "for a full grid."
+    )
+
+    _render_overview_strip(family_names, str(config.DATA_DIR))
+
+    st.markdown("---")
+
+    # ── Selected family detail grid ───────────────────────────────────────────
+    total_count = _count_family_images(str(config.DATA_DIR), selected_family)
+    st.subheader(f"📁 {selected_family}")
+
+    col_info1, col_info2, col_info3 = st.columns(3)
+    col_info1.metric("Total Samples", total_count)
+    col_info2.metric("Showing", min(max_images, total_count))
+    col_info3.metric("Image Size", "128 × 128 px")
+
+    # MITRE context for selected family
     try:
-        with open(path, 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        print(f"[MalTwin] MITRE mapping file not found: {path}", file=sys.stderr)
-        return {}
-    except json.JSONDecodeError as e:
-        print(f"[MalTwin] MITRE mapping JSON parse error: {e}", file=sys.stderr)
-        return {}
+        from modules.reporting.mitre_mapper import get_mitre_mapping
+        mitre = get_mitre_mapping(selected_family)
+        if mitre['found']:
+            with st.expander("MITRE ATT&CK for ICS Context", expanded=False):
+                st.markdown(f"**Description:** {mitre['description']}")
+                st.markdown(f"**Tactics:** {', '.join(mitre['tactics'])}")
+                for tech in mitre['techniques']:
+                    st.markdown(f"- `{tech['id']}` — {tech['name']}")
+    except Exception:
+        pass   # MITRE context is a nice-to-have; never crash the gallery
+
+    st.markdown("---")
+
+    with st.spinner(f"Loading {min(max_images, total_count)} images…"):
+        images = _load_sample_images(str(config.DATA_DIR), selected_family, max_images)
+
+    if not images:
+        st.warning(f"No PNG images found in `data/malimg/{selected_family}/`.")
+        return
+
+    _render_image_grid(images, selected_family, n_cols)
 
 
-def get_mitre_mapping(family_name: str, db: dict | None = None) -> dict:
+def _render_overview_strip(family_names: list[str], data_dir: str) -> None:
     """
-    Look up MITRE ATT&CK for ICS data for a single malware family.
-
-    Args:
-        family_name: predicted family string e.g. 'Allaple.A'
-        db:          pre-loaded DB dict (optional — loads fresh if None)
-
-    Returns:
-        {
-            'tactics':     list[str],
-            'techniques':  list[dict],   # [{'id': str, 'name': str}, ...]
-            'description': str,
-            'found':       bool,
-        }
+    Render one representative image per family in a horizontal scrolling strip.
+    Uses 8 columns per row, wraps to next row automatically.
     """
-    if db is None:
-        db = load_mitre_db()
+    STRIP_COLS = 8
+    chunks = [
+        family_names[i:i + STRIP_COLS]
+        for i in range(0, len(family_names), STRIP_COLS)
+    ]
 
-    entry = db.get(family_name, {})
-    return {
-        'tactics':     entry.get('tactics', []),
-        'techniques':  entry.get('techniques', []),
-        'description': entry.get('description', ''),
-        'found':       bool(entry),
-    }
+    for chunk in chunks:
+        cols = st.columns(len(chunk))
+        for col, family in zip(cols, chunk):
+            images = _load_sample_images(data_dir, family, max_images=1)
+            with col:
+                if images:
+                    st.image(
+                        images[0],
+                        caption=family,
+                        use_column_width=True,
+                        clamp=True,
+                    )
+                else:
+                    st.caption(family)
+                    st.markdown("_(no image)_")
+
+
+def _render_image_grid(
+    images: list[np.ndarray],
+    family_name: str,
+    n_cols: int,
+) -> None:
+    """
+    Render a grid of grayscale images with filenames as captions.
+    Fills rows left-to-right, wraps at n_cols.
+    """
+    for row_start in range(0, len(images), n_cols):
+        row_images = images[row_start:row_start + n_cols]
+        cols = st.columns(n_cols)
+        for col, img_array in zip(cols, row_images):
+            with col:
+                st.image(
+                    img_array,
+                    caption=f"{family_name} #{row_start + cols.index(col) + 1}",
+                    use_column_width=True,
+                    clamp=True,
+                )
 ```
 
 ---
 
-## File 3: `data/mitre_ics_mapping.json`
+## File 3: Update `modules/dashboard/pages/home.py`
 
-Create this file at `data/mitre_ics_mapping.json`. This is the complete mapping for all 25 Malimg families to their closest MITRE ATT&CK for ICS tactics and techniques.
+### 3a — Replace `_render_recent_detections()` section
 
-```json
-{
-  "Adialer.C": {
-    "description": "Dialer trojan that establishes unauthorized premium-rate phone connections. Targets Windows systems.",
-    "tactics": ["Initial Access", "Execution", "Command and Control"],
-    "techniques": [
-      {"id": "T0866", "name": "Exploitation of Remote Services"},
-      {"id": "T0858", "name": "Change Operating Mode"},
-      {"id": "T0884", "name": "Connection Proxy"}
-    ]
-  },
-  "Agent.FYI": {
-    "description": "Remote access trojan providing backdoor access and data exfiltration capabilities.",
-    "tactics": ["Persistence", "Command and Control", "Collection"],
-    "techniques": [
-      {"id": "T0859", "name": "Valid Accounts"},
-      {"id": "T0884", "name": "Connection Proxy"},
-      {"id": "T0811", "name": "Data from Local System"}
-    ]
-  },
-  "Allaple.A": {
-    "description": "Highly prevalent network worm with aggressive self-propagation via network shares and exploits.",
-    "tactics": ["Lateral Movement", "Discovery", "Command and Control"],
-    "techniques": [
-      {"id": "T0812", "name": "Default Credentials"},
-      {"id": "T0840", "name": "Network Connection Enumeration"},
-      {"id": "T0885", "name": "Commonly Used Port"}
-    ]
-  },
-  "Allaple.L": {
-    "description": "Variant of the Allaple worm family with modified propagation and obfuscation techniques.",
-    "tactics": ["Lateral Movement", "Defense Evasion", "Command and Control"],
-    "techniques": [
-      {"id": "T0812", "name": "Default Credentials"},
-      {"id": "T0858", "name": "Change Operating Mode"},
-      {"id": "T0884", "name": "Connection Proxy"}
-    ]
-  },
-  "Alueron.gen!J": {
-    "description": "Generic detection for the Alueron rootkit family. Hides processes and network connections.",
-    "tactics": ["Defense Evasion", "Persistence", "Discovery"],
-    "techniques": [
-      {"id": "T0820", "name": "Exploitation for Evasion"},
-      {"id": "T0839", "name": "Module Firmware"},
-      {"id": "T0842", "name": "Network Sniffing"}
-    ]
-  },
-  "Autorun.K": {
-    "description": "Worm spreading via removable media autorun functionality.",
-    "tactics": ["Initial Access", "Lateral Movement", "Execution"],
-    "techniques": [
-      {"id": "T0847", "name": "Replication Through Removable Media"},
-      {"id": "T0863", "name": "User Execution"},
-      {"id": "T0859", "name": "Valid Accounts"}
-    ]
-  },
-  "BrowseFox.B": {
-    "description": "Adware/browser hijacker that modifies browser settings and injects ads.",
-    "tactics": ["Execution", "Collection", "Command and Control"],
-    "techniques": [
-      {"id": "T0863", "name": "User Execution"},
-      {"id": "T0811", "name": "Data from Local System"},
-      {"id": "T0884", "name": "Connection Proxy"}
-    ]
-  },
-  "Dialplatform.B": {
-    "description": "Dialer platform malware that establishes covert outbound connections to premium services.",
-    "tactics": ["Command and Control", "Exfiltration", "Impact"],
-    "techniques": [
-      {"id": "T0884", "name": "Connection Proxy"},
-      {"id": "T0830", "name": "Adversary-in-the-Middle"},
-      {"id": "T0831", "name": "Manipulation of Control"}
-    ]
-  },
-  "Dontovo.A": {
-    "description": "Trojan dropper that installs additional malware components on infected systems.",
-    "tactics": ["Execution", "Persistence", "Defense Evasion"],
-    "techniques": [
-      {"id": "T0863", "name": "User Execution"},
-      {"id": "T0839", "name": "Module Firmware"},
-      {"id": "T0820", "name": "Exploitation for Evasion"}
-    ]
-  },
-  "Fakerean": {
-    "description": "Rogue security software displaying false alerts to extort payment from victims.",
-    "tactics": ["Impact", "Execution", "Command and Control"],
-    "techniques": [
-      {"id": "T0831", "name": "Manipulation of Control"},
-      {"id": "T0863", "name": "User Execution"},
-      {"id": "T0885", "name": "Commonly Used Port"}
-    ]
-  },
-  "Instantaccess": {
-    "description": "Adware that provides instant access to premium online content through unauthorized billing.",
-    "tactics": ["Execution", "Command and Control", "Impact"],
-    "techniques": [
-      {"id": "T0863", "name": "User Execution"},
-      {"id": "T0884", "name": "Connection Proxy"},
-      {"id": "T0831", "name": "Manipulation of Control"}
-    ]
-  },
-  "Lolyda.AA1": {
-    "description": "Password stealer targeting browser credentials, email clients, and FTP applications.",
-    "tactics": ["Credential Access", "Collection", "Exfiltration"],
-    "techniques": [
-      {"id": "T0819", "name": "Exploit Public-Facing Application"},
-      {"id": "T0811", "name": "Data from Local System"},
-      {"id": "T0830", "name": "Adversary-in-the-Middle"}
-    ]
-  },
-  "Lolyda.AA2": {
-    "description": "Variant of Lolyda password stealer with enhanced credential harvesting.",
-    "tactics": ["Credential Access", "Collection", "Exfiltration"],
-    "techniques": [
-      {"id": "T0819", "name": "Exploit Public-Facing Application"},
-      {"id": "T0811", "name": "Data from Local System"},
-      {"id": "T0842", "name": "Network Sniffing"}
-    ]
-  },
-  "Lolyda.AA3": {
-    "description": "Third variant of Lolyda with added persistence and anti-analysis techniques.",
-    "tactics": ["Credential Access", "Persistence", "Defense Evasion"],
-    "techniques": [
-      {"id": "T0819", "name": "Exploit Public-Facing Application"},
-      {"id": "T0859", "name": "Valid Accounts"},
-      {"id": "T0820", "name": "Exploitation for Evasion"}
-    ]
-  },
-  "Lolyda.AT": {
-    "description": "Lolyda variant targeting AT-class systems with enhanced lateral movement.",
-    "tactics": ["Lateral Movement", "Credential Access", "Collection"],
-    "techniques": [
-      {"id": "T0866", "name": "Exploitation of Remote Services"},
-      {"id": "T0819", "name": "Exploit Public-Facing Application"},
-      {"id": "T0811", "name": "Data from Local System"}
-    ]
-  },
-  "Malex.gen!J": {
-    "description": "Generic Malex trojan with polymorphic code generation and rootkit capabilities.",
-    "tactics": ["Defense Evasion", "Persistence", "Command and Control"],
-    "techniques": [
-      {"id": "T0820", "name": "Exploitation for Evasion"},
-      {"id": "T0839", "name": "Module Firmware"},
-      {"id": "T0884", "name": "Connection Proxy"}
-    ]
-  },
-  "Obfuscator.AD": {
-    "description": "Obfuscated malware loader that decrypts and executes embedded payloads at runtime.",
-    "tactics": ["Defense Evasion", "Execution", "Persistence"],
-    "techniques": [
-      {"id": "T0820", "name": "Exploitation for Evasion"},
-      {"id": "T0863", "name": "User Execution"},
-      {"id": "T0839", "name": "Module Firmware"}
-    ]
-  },
-  "Rbot!gen": {
-    "description": "IRC-controlled botnet client with DDoS, spam relay, and credential theft capabilities.",
-    "tactics": ["Command and Control", "Impact", "Lateral Movement"],
-    "techniques": [
-      {"id": "T0885", "name": "Commonly Used Port"},
-      {"id": "T0814", "name": "Denial of Service"},
-      {"id": "T0812", "name": "Default Credentials"}
-    ]
-  },
-  "Skintrim.N": {
-    "description": "Trojan that modifies system settings and installs additional malware components silently.",
-    "tactics": ["Persistence", "Defense Evasion", "Execution"],
-    "techniques": [
-      {"id": "T0839", "name": "Module Firmware"},
-      {"id": "T0820", "name": "Exploitation for Evasion"},
-      {"id": "T0863", "name": "User Execution"}
-    ]
-  },
-  "Swizzor.gen!E": {
-    "description": "Polymorphic downloader that fetches and installs additional malware from remote servers.",
-    "tactics": ["Command and Control", "Execution", "Defense Evasion"],
-    "techniques": [
-      {"id": "T0884", "name": "Connection Proxy"},
-      {"id": "T0863", "name": "User Execution"},
-      {"id": "T0820", "name": "Exploitation for Evasion"}
-    ]
-  },
-  "Swizzor.gen!I": {
-    "description": "Variant of Swizzor downloader with improved anti-analysis and traffic encryption.",
-    "tactics": ["Command and Control", "Defense Evasion", "Execution"],
-    "techniques": [
-      {"id": "T0884", "name": "Connection Proxy"},
-      {"id": "T0820", "name": "Exploitation for Evasion"},
-      {"id": "T0858", "name": "Change Operating Mode"}
-    ]
-  },
-  "VB.AT": {
-    "description": "Visual Basic-compiled trojan with keylogging and remote shell capabilities.",
-    "tactics": ["Collection", "Command and Control", "Exfiltration"],
-    "techniques": [
-      {"id": "T0811", "name": "Data from Local System"},
-      {"id": "T0885", "name": "Commonly Used Port"},
-      {"id": "T0830", "name": "Adversary-in-the-Middle"}
-    ]
-  },
-  "Wintrim.BX": {
-    "description": "Trimmer malware that strips system protections and installs persistent backdoors.",
-    "tactics": ["Defense Evasion", "Persistence", "Impact"],
-    "techniques": [
-      {"id": "T0820", "name": "Exploitation for Evasion"},
-      {"id": "T0839", "name": "Module Firmware"},
-      {"id": "T0831", "name": "Manipulation of Control"}
-    ]
-  },
-  "Yuner.A": {
-    "description": "Worm with fast self-replication via network drives and email attachment propagation.",
-    "tactics": ["Lateral Movement", "Initial Access", "Execution"],
-    "techniques": [
-      {"id": "T0847", "name": "Replication Through Removable Media"},
-      {"id": "T0866", "name": "Exploitation of Remote Services"},
-      {"id": "T0863", "name": "User Execution"}
-    ]
-  },
-  "Zlob.gen!D": {
-    "description": "Generic Zlob downloader variant. Poses as a media codec, downloads additional payloads.",
-    "tactics": ["Initial Access", "Execution", "Command and Control"],
-    "techniques": [
-      {"id": "T0863", "name": "User Execution"},
-      {"id": "T0866", "name": "Exploitation of Remote Services"},
-      {"id": "T0884", "name": "Connection Proxy"}
-    ]
-  }
-}
-```
-
----
-
-## File 4: `modules/reporting/json_report.py`
+Find and replace the entire `# ── Recent Detection Feed` block in `render()`:
 
 ```python
-# modules/reporting/json_report.py
-"""
-Structured JSON forensic report builder.
-
-SRS refs: M8 FE-1, FE-2, FE-3, UC-03
-"""
-import json
-from datetime import datetime
-from pathlib import Path
-
-import config
-from .mitre_mapper import get_mitre_mapping, load_mitre_db
-
-
-def generate_json_report(report_data: dict) -> bytes:
-    """
-    Build a structured JSON forensic report from a report_data dict.
-
-    Args:
-        report_data: assembled by build_report_data() in detection.py.
-            Required keys:
-                file_name, sha256, file_format, file_size_bytes, upload_time,
-                predicted_family, confidence, top3, all_probabilities,
-                gradcam (dict with 'generated': bool),
-                mitre (dict from get_mitre_mapping())
-
-    Returns:
-        UTF-8 encoded JSON bytes — always returns bytes even on error
-        (returns a minimal error JSON on failure).
-    """
-    try:
-        mitre = report_data.get('mitre', {})
-        gradcam = report_data.get('gradcam', {'generated': False})
-
-        report = {
-            'report_metadata': {
-                'generator':       'MalTwin Forensic Reporting Module',
-                'report_version':  '1.0',
-                'generated_at':    datetime.utcnow().isoformat(),
-                'framework':       'MalTwin v1.0 — COMSATS University Islamabad',
-            },
-            'file_information': {
-                'file_name':       report_data['file_name'],
-                'sha256':          report_data['sha256'],
-                'file_format':     report_data['file_format'],
-                'file_size_bytes': report_data['file_size_bytes'],
-                'upload_time':     report_data['upload_time'],
-            },
-            'detection_result': {
-                'predicted_family': report_data['predicted_family'],
-                'confidence':       round(float(report_data['confidence']), 6),
-                'confidence_pct':   round(float(report_data['confidence']) * 100, 2),
-                'top3_predictions': [
-                    {
-                        'rank':       i + 1,
-                        'family':     pred['family'],
-                        'confidence': round(float(pred['confidence']), 6),
-                    }
-                    for i, pred in enumerate(report_data.get('top3', []))
-                ],
-                'all_class_probabilities': {
-                    k: round(float(v), 6)
-                    for k, v in report_data.get('all_probabilities', {}).items()
-                },
-            },
-            'mitre_attack_ics': {
-                'family':      report_data['predicted_family'],
-                'mapping_found': mitre.get('found', False),
-                'description': mitre.get('description', ''),
-                'tactics':     mitre.get('tactics', []),
-                'techniques':  mitre.get('techniques', []),
-                'framework':   'MITRE ATT&CK for ICS',
-                'reference':   'https://attack.mitre.org/matrices/ics/',
-            },
-            'explainability': {
-                'gradcam_generated': gradcam.get('generated', False),
-                'target_class':      gradcam.get('target_class', None),
-                'layer':             gradcam.get('layer', None),
-                'method':            'Captum LayerGradCam' if gradcam.get('generated') else None,
-            },
-        }
-
-        return json.dumps(report, indent=2, ensure_ascii=False).encode('utf-8')
-
-    except Exception as e:
-        error_report = {
-            'error':   'Report generation failed',
-            'reason':  str(e),
-            'partial': {
-                'file_name':        report_data.get('file_name', 'unknown'),
-                'sha256':           report_data.get('sha256', 'unknown'),
-                'predicted_family': report_data.get('predicted_family', 'unknown'),
-            },
-        }
-        return json.dumps(error_report, indent=2).encode('utf-8')
-
-
-def save_json_report(report_bytes: bytes, sha256: str) -> Path:
-    """
-    Save JSON report bytes to config.REPORTS_DIR.
-
-    Args:
-        report_bytes: output of generate_json_report()
-        sha256:       full SHA-256 hex string of the analyzed file
-
-    Returns:
-        Path to the saved file.
-    """
-    config.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    filename = f"maltwin_report_{sha256[:8]}.json"
-    out_path = config.REPORTS_DIR / filename
-    out_path.write_bytes(report_bytes)
-    return out_path
+    # ── Recent Detection Feed (with filters) ──────────────────────────────────
+    st.subheader("Detection History")
+    _render_history_section()
 ```
 
----
+### 3b — Add `_render_history_section()` function
 
-## File 5: `modules/reporting/pdf_report.py`
+Add this new function at the bottom of `home.py`:
 
 ```python
-# modules/reporting/pdf_report.py
-"""
-PDF forensic report generator using FPDF2.
-
-SRS refs: M8 FE-1, FE-2, FE-3, UC-03
-
-Uses fpdf2 (imported as `from fpdf import FPDF`).
-Never raises — returns None on failure so caller can fall back to JSON.
-
-Layout (A4, portrait):
-  Page 1: Header, File Information, Detection Result, Confidence bar
-  Page 2: MITRE ATT&CK for ICS mapping
-  Page 3: Top-3 Predictions table + Grad-CAM heatmap (if available)
-"""
-import io
-import sys
-import tempfile
-import os
-from datetime import datetime
-from pathlib import Path
-
-import config
-
-try:
-    from fpdf import FPDF
-    FPDF2_AVAILABLE = True
-except ImportError:
-    FPDF2_AVAILABLE = False
-
-
-class _MalTwinPDF(FPDF):
-    """Custom FPDF subclass with header and footer."""
-
-    def header(self):
-        self.set_font('Helvetica', 'B', 11)
-        self.set_fill_color(30, 30, 50)      # dark navy
-        self.set_text_color(255, 255, 255)
-        self.cell(0, 10, '  MalTwin — IIoT Malware Detection Framework', fill=True, ln=True)
-        self.set_font('Helvetica', '', 8)
-        self.set_text_color(120, 120, 120)
-        self.cell(0, 5, f'  Forensic Analysis Report | Generated {datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")} UTC', ln=True)
-        self.set_text_color(0, 0, 0)
-        self.ln(3)
-
-    def footer(self):
-        self.set_y(-15)
-        self.set_font('Helvetica', 'I', 8)
-        self.set_text_color(150, 150, 150)
-        self.cell(0, 10, f'Page {self.page_no()} | COMSATS University Islamabad | BS Cyber Security 2023-2027', align='C')
-
-    def section_title(self, title: str):
-        self.set_font('Helvetica', 'B', 12)
-        self.set_fill_color(240, 240, 248)
-        self.set_text_color(30, 30, 80)
-        self.cell(0, 8, f'  {title}', fill=True, ln=True)
-        self.set_text_color(0, 0, 0)
-        self.ln(2)
-
-    def kv_row(self, label: str, value: str, label_width: int = 55):
-        self.set_font('Helvetica', 'B', 9)
-        self.cell(label_width, 6, label, border='B')
-        self.set_font('Helvetica', '', 9)
-        self.multi_cell(0, 6, value, border='B')
-
-    def confidence_bar(self, confidence: float):
-        """Draw a colored confidence bar (green/amber/red)."""
-        bar_w = 140
-        bar_h = 8
-        x, y  = self.get_x(), self.get_y()
-
-        # Background
-        self.set_fill_color(220, 220, 220)
-        self.rect(x, y, bar_w, bar_h, 'F')
-
-        # Fill color
-        if confidence >= config.CONFIDENCE_GREEN:
-            self.set_fill_color(50, 180, 80)   # green
-        elif confidence >= config.CONFIDENCE_AMBER:
-            self.set_fill_color(230, 160, 30)  # amber
-        else:
-            self.set_fill_color(210, 50, 50)   # red
-
-        fill_w = bar_w * confidence
-        self.rect(x, y, fill_w, bar_h, 'F')
-
-        # Label
-        self.set_xy(x + bar_w + 3, y)
-        self.set_font('Helvetica', 'B', 9)
-        self.cell(30, bar_h, f'{confidence * 100:.1f}%')
-        self.ln(bar_h + 2)
-
-
-def generate_pdf_report(report_data: dict) -> bytes | None:
+def _render_history_section() -> None:
     """
-    Generate a complete PDF forensic report.
-
-    Args:
-        report_data: same dict used by generate_json_report(). Keys:
-            file_name, sha256, file_format, file_size_bytes, upload_time,
-            predicted_family, confidence, top3, all_probabilities,
-            gradcam (dict), mitre (dict from get_mitre_mapping())
-
-    Returns:
-        PDF bytes on success.
-        None on failure (caller falls back to JSON and notifies user).
+    Filterable, sortable detection history table.
+    SRS refs: FR1.4, M8 FE-5
     """
-    if not FPDF2_AVAILABLE:
-        print("[MalTwin] fpdf2 not installed — PDF generation unavailable.", file=sys.stderr)
-        return None
+    import pandas as pd
+    from modules.dashboard.db import get_filtered_events, get_family_list
 
-    try:
-        pdf = _MalTwinPDF(orientation='P', unit='mm', format='A4')
-        pdf.set_auto_page_break(auto=True, margin=20)
-        pdf.add_page()
+    # ── Filter controls ───────────────────────────────────────────────────────
+    with st.expander("🔍 Filter & Sort", expanded=False):
+        col_f1, col_f2, col_f3, col_f4 = st.columns(4)
 
-        # ── Page 1: File Info + Detection Result ──────────────────────────────
-        pdf.section_title('File Information')
-        pdf.kv_row('File Name:',    report_data['file_name'])
-        pdf.kv_row('File Format:',  report_data['file_format'])
-        pdf.kv_row('File Size:',    f"{report_data['file_size_bytes']:,} bytes")
-        pdf.kv_row('Upload Time:',  report_data['upload_time'])
-        sha = report_data['sha256']
-        pdf.kv_row('SHA-256 (1/2):', sha[:32])
-        pdf.kv_row('SHA-256 (2/2):', sha[32:])
-        pdf.ln(5)
-
-        pdf.section_title('Detection Result')
-        confidence = float(report_data['confidence'])
-        family     = report_data['predicted_family']
-
-        pdf.set_font('Helvetica', 'B', 16)
-        if confidence >= config.CONFIDENCE_GREEN:
-            pdf.set_text_color(50, 180, 80)
-        elif confidence >= config.CONFIDENCE_AMBER:
-            pdf.set_text_color(230, 160, 30)
-        else:
-            pdf.set_text_color(210, 50, 50)
-        pdf.cell(0, 10, f'Predicted Family: {family}', ln=True)
-        pdf.set_text_color(0, 0, 0)
-
-        pdf.set_font('Helvetica', '', 9)
-        pdf.cell(0, 5, 'Confidence:', ln=True)
-        pdf.confidence_bar(confidence)
-
-        # Confidence advisory
-        pdf.set_font('Helvetica', 'I', 8)
-        if confidence >= config.CONFIDENCE_GREEN:
-            advisory = 'High confidence detection. Result is reliable.'
-        elif confidence >= config.CONFIDENCE_AMBER:
-            advisory = 'Medium confidence. Manual verification recommended.'
-        else:
-            advisory = 'Low confidence. Expert review required before action.'
-        pdf.set_text_color(100, 100, 100)
-        pdf.cell(0, 5, advisory, ln=True)
-        pdf.set_text_color(0, 0, 0)
-        pdf.ln(5)
-
-        # Top-3 predictions table
-        pdf.section_title('Top 3 Predictions')
-        pdf.set_font('Helvetica', 'B', 9)
-        pdf.set_fill_color(200, 200, 220)
-        pdf.cell(10, 7, 'Rank', fill=True, border=1)
-        pdf.cell(100, 7, 'Malware Family', fill=True, border=1)
-        pdf.cell(40, 7, 'Confidence', fill=True, border=1)
-        pdf.ln()
-        pdf.set_font('Helvetica', '', 9)
-        for i, pred in enumerate(report_data.get('top3', []), 1):
-            pdf.cell(10, 6, str(i), border=1)
-            pdf.cell(100, 6, pred['family'], border=1)
-            pdf.cell(40, 6, f"{float(pred['confidence'])*100:.2f}%", border=1)
-            pdf.ln()
-        pdf.ln(5)
-
-        # ── Page 2: MITRE ATT&CK for ICS ─────────────────────────────────────
-        pdf.add_page()
-        pdf.section_title('MITRE ATT\u0026CK for ICS Mapping')
-        mitre = report_data.get('mitre', {})
-
-        if not mitre.get('found', False):
-            pdf.set_font('Helvetica', 'I', 9)
-            pdf.cell(0, 6, f'No MITRE mapping available for family: {family}', ln=True)
-        else:
-            pdf.set_font('Helvetica', '', 9)
-            if mitre.get('description'):
-                pdf.set_font('Helvetica', 'I', 9)
-                pdf.multi_cell(0, 5, mitre['description'])
-                pdf.ln(3)
-
-            pdf.set_font('Helvetica', 'B', 9)
-            pdf.cell(0, 6, 'Tactics:', ln=True)
-            pdf.set_font('Helvetica', '', 9)
-            tactics_str = ' | '.join(mitre.get('tactics', []))
-            pdf.multi_cell(0, 5, tactics_str or 'None identified')
-            pdf.ln(3)
-
-            pdf.set_font('Helvetica', 'B', 9)
-            pdf.cell(0, 6, 'Techniques:', ln=True)
-            pdf.set_font('Helvetica', 'B', 9)
-            pdf.set_fill_color(200, 200, 220)
-            pdf.cell(30, 7, 'ID', fill=True, border=1)
-            pdf.cell(130, 7, 'Technique Name', fill=True, border=1)
-            pdf.ln()
-            pdf.set_font('Helvetica', '', 9)
-            for tech in mitre.get('techniques', []):
-                pdf.cell(30, 6, tech.get('id', ''), border=1)
-                pdf.cell(130, 6, tech.get('name', ''), border=1)
-                pdf.ln()
-
-        pdf.ln(8)
-        pdf.set_font('Helvetica', 'I', 8)
-        pdf.set_text_color(100, 100, 100)
-        pdf.cell(0, 5, 'Reference: MITRE ATT&CK for ICS — https://attack.mitre.org/matrices/ics/', ln=True)
-        pdf.set_text_color(0, 0, 0)
-
-        # ── Page 3: Grad-CAM Heatmap (if available) ───────────────────────────
-        gradcam = report_data.get('gradcam', {})
-        if gradcam.get('generated') and gradcam.get('overlay_png_bytes'):
-            pdf.add_page()
-            pdf.section_title('Explainable AI — Grad-CAM Heatmap')
-
-            pdf.set_font('Helvetica', '', 9)
-            pdf.multi_cell(0, 5,
-                'The Grad-CAM heatmap highlights which byte regions of the binary image '
-                'most strongly influenced the classification decision. '
-                'Warm (red/yellow) regions correspond to high attribution areas. '
-                f'Target layer: {gradcam.get("layer", "block3.conv2")}.'
+        with col_f1:
+            family_options = get_family_list(config.DB_PATH)
+            family_filter = st.selectbox(
+                "Malware Family",
+                options=family_options,
+                index=0,
+                key="history_family_filter",
             )
-            pdf.ln(3)
 
-            # Save PNG to a temp file for FPDF to embed
-            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                tmp.write(gradcam['overlay_png_bytes'])
-                tmp_path = tmp.name
+        with col_f2:
+            min_conf = st.slider(
+                "Min Confidence",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.0,
+                step=0.05,
+                format="%.0f%%",
+                key="history_min_conf",
+            )
 
-            try:
-                # Centre the image on the page (A4 width = 210mm, margins = 10mm each side)
-                img_w = 130
-                x_pos = (210 - img_w) / 2
-                pdf.image(tmp_path, x=x_pos, w=img_w)
-                pdf.ln(5)
-                pdf.set_font('Helvetica', 'I', 8)
-                pdf.set_text_color(100, 100, 100)
-                pdf.cell(0, 5,
-                    f'Figure: Grad-CAM overlay for {family} | '
-                    f'Method: Captum LayerGradCam | Layer: {gradcam.get("layer", "")}',
-                    align='C', ln=True,
-                )
-                pdf.set_text_color(0, 0, 0)
-            finally:
-                os.unlink(tmp_path)   # always clean up temp file
+        with col_f3:
+            days_options = {
+                "All time":    None,
+                "Last 7 days":  7,
+                "Last 30 days": 30,
+                "Last 90 days": 90,
+            }
+            days_label = st.selectbox(
+                "Time Range",
+                options=list(days_options.keys()),
+                index=0,
+                key="history_days",
+            )
+            days_back = days_options[days_label]
 
-        # ── Final page: Disclaimer ────────────────────────────────────────────
-        pdf.ln(10)
-        pdf.set_font('Helvetica', 'I', 7)
-        pdf.set_text_color(130, 130, 130)
-        pdf.multi_cell(0, 4,
-            'DISCLAIMER: This report is generated by an AI-based malware classification system '
-            'for research and academic purposes only. Results should be validated by a qualified '
-            'cybersecurity professional before any operational decision is made. '
-            'MalTwin is a research prototype — COMSATS University Islamabad, BS Cyber Security 2023-2027.'
+        with col_f4:
+            sort_desc = st.radio(
+                "Sort Order",
+                options=["Newest first", "Oldest first"],
+                index=0,
+                key="history_sort",
+            ) == "Newest first"
+
+        limit = st.slider(
+            "Max rows",
+            min_value=10,
+            max_value=500,
+            value=50,
+            step=10,
+            key="history_limit",
         )
 
-        return bytes(pdf.output())
+    # ── Fetch events ──────────────────────────────────────────────────────────
+    events = get_filtered_events(
+        db_path=config.DB_PATH,
+        family_filter=family_filter if family_filter != 'All Families' else None,
+        min_confidence=min_conf,
+        days_back=days_back,
+        limit=limit,
+        sort_desc=sort_desc,
+    )
 
-    except Exception as e:
-        print(f"[MalTwin] PDF generation failed: {e}", file=sys.stderr)
-        return None
+    if not events:
+        st.caption(
+            "No detections match the current filters. "
+            "Upload a binary file on the Binary Upload page to get started."
+        )
+        return
 
+    # ── Build display dataframe ───────────────────────────────────────────────
+    df = pd.DataFrame(events)
 
-def save_pdf_report(pdf_bytes: bytes, sha256: str) -> Path:
-    """
-    Save PDF report bytes to config.REPORTS_DIR.
+    # Format columns for display
+    df['confidence_pct'] = df['confidence'].apply(lambda x: f"{x * 100:.1f}%")
+    df['timestamp']      = pd.to_datetime(df['timestamp']).dt.strftime('%Y-%m-%d %H:%M:%S')
 
-    Returns:
-        Path to the saved file.
-    """
-    config.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    filename = f"maltwin_report_{sha256[:8]}.pdf"
-    out_path = config.REPORTS_DIR / filename
-    out_path.write_bytes(pdf_bytes)
-    return out_path
+    display_df = df[[
+        'timestamp', 'file_name', 'predicted_family',
+        'confidence_pct', 'file_format', 'device_used',
+    ]].copy()
+    display_df.columns = [
+        'Timestamp', 'File', 'Predicted Family',
+        'Confidence', 'Format', 'Device',
+    ]
+
+    # ── Summary metrics ───────────────────────────────────────────────────────
+    col_m1, col_m2, col_m3 = st.columns(3)
+    col_m1.metric("Rows shown", len(events))
+    col_m2.metric(
+        "Avg confidence",
+        f"{df['confidence'].mean() * 100:.1f}%",
+    )
+    col_m3.metric(
+        "Unique families",
+        df['predicted_family'].nunique(),
+    )
+
+    # ── Table ─────────────────────────────────────────────────────────────────
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # ── CSV export ────────────────────────────────────────────────────────────
+    csv_bytes = display_df.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="📥 Export to CSV",
+        data=csv_bytes,
+        file_name="maltwin_detection_history.csv",
+        mime="text/csv",
+        help="Download the filtered detection history as a CSV file.",
+    )
 ```
 
 ---
 
-## File 6: Update `modules/dashboard/pages/detection.py`
+## File 4: Update `modules/dashboard/app.py`
 
-### 6a — Add helper `build_report_data()`
+### 4a — Add gallery to sidebar navigation
 
-Add this function alongside the other private helpers:
+In `render_sidebar()`, replace the `options` list in `st.sidebar.radio()`:
 
 ```python
-def _build_report_data() -> dict:
-    """
-    Assemble the complete report_data dict from session state.
-    Used by both PDF and JSON report generators.
-    Called only when a detection result exists.
-    """
-    from modules.reporting.mitre_mapper import get_mitre_mapping
-
-    result    = st.session_state[state.KEY_DETECTION]
-    meta      = st.session_state[state.KEY_FILE_META]
-    heatmap   = st.session_state.get(state.KEY_HEATMAP)
-
-    mitre_data = get_mitre_mapping(result['predicted_family'])
-
-    gradcam_info = {'generated': False}
-    if heatmap is not None:
-        gradcam_info = {
-            'generated':        True,
-            'target_class':     heatmap['target_class'],
-            'layer':            heatmap['captum_layer'],
-            'overlay_png_bytes': heatmap['overlay_png'],   # bytes for PDF embedding
-        }
-
-    return {
-        'file_name':        meta['name'],
-        'sha256':           meta['sha256'],
-        'file_format':      meta['format'],
-        'file_size_bytes':  meta['size_bytes'],
-        'upload_time':      meta['upload_time'],
-        'predicted_family': result['predicted_family'],
-        'confidence':       float(result['confidence']),
-        'top3':             result['top3'],
-        'all_probabilities': result['probabilities'],
-        'gradcam':          gradcam_info,
-        'mitre':            mitre_data,
-    }
+    page = st.sidebar.radio(
+        "Navigation",
+        options=[
+            "🏠 Dashboard",
+            "📂 Binary Upload",
+            "🔍 Malware Detection",
+            "🖼️ Dataset Gallery",
+            "🖥️ Digital Twin",
+        ],
+        label_visibility="hidden",
+    )
 ```
 
-### 6b — Replace the entire `# ── F: Report Export` section in `_render_results()`
+### 4b — Add gallery route in `main()`
+
+Add the gallery branch to the `if/elif` routing block:
 
 ```python
-    # ── F: Forensic Report Export ─────────────────────────────────────────────
-    st.subheader("Forensic Report")
-
-    report_data = _build_report_data()
-
-    col_pdf, col_json = st.columns(2)
-
-    with col_pdf:
-        if st.button(
-            "📄 Generate PDF Report",
-            type="secondary",
-            use_container_width=True,
-            help="Generate a PDF forensic report with MITRE ATT&CK mapping "
-                 "and Grad-CAM heatmap (if generated).",
-        ):
-            with st.spinner("Generating PDF report…"):
-                from modules.reporting.pdf_report import generate_pdf_report
-                pdf_bytes = generate_pdf_report(report_data)
-
-            if pdf_bytes is None:
-                st.error(
-                    "Error: PDF generation failed. "
-                    "Cause: fpdf2 error or missing dependency. "
-                    "Action: Use the JSON download instead."
-                )
-            else:
-                meta = st.session_state[state.KEY_FILE_META]
-                st.download_button(
-                    label="📥 Download PDF Report",
-                    data=pdf_bytes,
-                    file_name=f"maltwin_report_{meta['sha256'][:8]}.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
-
-    with col_json:
-        from modules.reporting.json_report import generate_json_report
-        json_bytes = generate_json_report(report_data)
-        meta = st.session_state[state.KEY_FILE_META]
-        st.download_button(
-            label="📥 Download JSON Report",
-            data=json_bytes,
-            file_name=f"maltwin_report_{meta['sha256'][:8]}.json",
-            mime="application/json",
-            use_container_width=True,
-            help="Full structured JSON report with MITRE ATT&CK mapping and detection metadata.",
-        )
-
-    if state.has_heatmap():
-        st.caption(
-            "✅ Grad-CAM heatmap will be embedded in the PDF report. "
-            "Generate the heatmap above first if you haven't already."
-        )
-    else:
-        st.caption(
-            "💡 Tip: Generate the Grad-CAM heatmap above to embed it in the PDF report."
-        )
+    elif page == "🖼️ Dataset Gallery":
+        from modules.dashboard.pages.gallery import render
+        render()
 ```
 
 ---
 
-## File 7: `tests/test_reporting.py`
+## File 5: `tests/test_gallery.py`
 
 ```python
 """
-Test suite for modules/reporting/
+Test suite for modules/dashboard/pages/gallery.py
+and the new db.py functions: get_filtered_events, get_family_list.
 
-Tests run without the Malimg dataset or a trained model.
-All report_data dicts are constructed inline.
+All tests use tmp_path — no real Malimg dataset required.
 
 Run:
-    pytest tests/test_reporting.py -v
+    pytest tests/test_gallery.py -v
 """
-import json
+import os
+import cv2
 import pytest
+import numpy as np
 from pathlib import Path
 
-from modules.reporting.mitre_mapper import load_mitre_db, get_mitre_mapping
-from modules.reporting.json_report import generate_json_report
-from modules.reporting.pdf_report import generate_pdf_report, FPDF2_AVAILABLE
+from modules.dashboard.db import (
+    init_db,
+    log_detection_event,
+    get_filtered_events,
+    get_family_list,
+)
+from modules.dashboard.pages.gallery import (
+    _load_family_names,
+    _load_sample_images,
+    _count_family_images,
+)
 
 
-# ── Shared fixture ────────────────────────────────────────────────────────────
+# ── Shared fixtures ───────────────────────────────────────────────────────────
 
 @pytest.fixture
-def sample_report_data():
-    return {
-        'file_name':        'suspicious.exe',
-        'sha256':           'a' * 64,
-        'file_format':      'PE',
-        'file_size_bytes':  2048,
-        'upload_time':      '2025-05-01T14:30:00',
-        'predicted_family': 'Allaple.A',
-        'confidence':       0.9312,
-        'top3': [
-            {'family': 'Allaple.A',  'confidence': 0.9312},
-            {'family': 'Allaple.L',  'confidence': 0.0421},
-            {'family': 'Rbot!gen',   'confidence': 0.0102},
-        ],
-        'all_probabilities': {f'Family_{i}': 0.01 for i in range(25)},
-        'gradcam': {'generated': False},
-        'mitre': {
-            'found':       True,
-            'description': 'Test family description.',
-            'tactics':     ['Lateral Movement', 'Discovery'],
-            'techniques':  [
-                {'id': 'T0840', 'name': 'Network Connection Enumeration'},
-            ],
-        },
-    }
+def temp_db(tmp_path):
+    db = tmp_path / "test.db"
+    init_db(db)
+    return db
+
+
+@pytest.fixture
+def populated_db(temp_db):
+    """DB with 10 events across 3 families."""
+    families = ['Allaple.A', 'Rbot!gen', 'VB.AT']
+    confs    = [0.95, 0.72, 0.45, 0.88, 0.61, 0.90, 0.55, 0.83, 0.40, 0.77]
+    for i, conf in enumerate(confs):
+        log_detection_event(
+            temp_db,
+            file_name=f"file_{i:02d}.exe",
+            sha256='a' * 64,
+            file_format='PE',
+            file_size=1024,
+            predicted_family=families[i % 3],
+            confidence=conf,
+            device_used='cpu',
+        )
+    return temp_db
+
+
+@pytest.fixture
+def fake_dataset(tmp_path):
+    """Fake Malimg-style directory: 3 families × 5 PNGs each."""
+    for family in ['Allaple.A', 'Rbot!gen', 'VB.AT']:
+        d = tmp_path / family
+        d.mkdir()
+        for i in range(5):
+            img = np.random.randint(0, 256, (16, 16), dtype=np.uint8)
+            cv2.imwrite(str(d / f'img_{i:03d}.png'), img)
+    return tmp_path
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MITRE mapper
+# get_filtered_events
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestMitreMapper:
-    def test_load_mitre_db_returns_dict(self):
-        db = load_mitre_db()
-        assert isinstance(db, dict)
+class TestGetFilteredEvents:
+    def test_returns_all_when_no_filters(self, populated_db):
+        events = get_filtered_events(populated_db)
+        assert len(events) == 10
 
-    def test_load_mitre_db_missing_file_returns_empty(self, tmp_path, monkeypatch):
-        import config
-        monkeypatch.setattr(config, 'MITRE_JSON_PATH', tmp_path / 'missing.json')
-        db = load_mitre_db(tmp_path / 'missing.json')
-        assert db == {}
+    def test_returns_empty_for_missing_db(self, tmp_path):
+        events = get_filtered_events(tmp_path / "missing.db")
+        assert events == []
 
-    def test_all_25_families_present(self):
-        """The seeded JSON must have all 25 Malimg families."""
-        db = load_mitre_db()
-        expected = {
-            'Adialer.C', 'Agent.FYI', 'Allaple.A', 'Allaple.L',
-            'Alueron.gen!J', 'Autorun.K', 'BrowseFox.B', 'Dialplatform.B',
-            'Dontovo.A', 'Fakerean', 'Instantaccess', 'Lolyda.AA1',
-            'Lolyda.AA2', 'Lolyda.AA3', 'Lolyda.AT', 'Malex.gen!J',
-            'Obfuscator.AD', 'Rbot!gen', 'Skintrim.N', 'Swizzor.gen!E',
-            'Swizzor.gen!I', 'VB.AT', 'Wintrim.BX', 'Yuner.A', 'Zlob.gen!D',
+    def test_family_filter_works(self, populated_db):
+        events = get_filtered_events(populated_db, family_filter='Allaple.A')
+        assert all(e['predicted_family'] == 'Allaple.A' for e in events)
+        assert len(events) > 0
+
+    def test_family_filter_all_families_returns_everything(self, populated_db):
+        events = get_filtered_events(populated_db, family_filter='All Families')
+        assert len(events) == 10
+
+    def test_confidence_filter_excludes_low_confidence(self, populated_db):
+        events = get_filtered_events(populated_db, min_confidence=0.80)
+        assert all(e['confidence'] >= 0.80 for e in events)
+
+    def test_confidence_filter_zero_returns_all(self, populated_db):
+        events = get_filtered_events(populated_db, min_confidence=0.0)
+        assert len(events) == 10
+
+    def test_limit_is_respected(self, populated_db):
+        events = get_filtered_events(populated_db, limit=3)
+        assert len(events) == 3
+
+    def test_sort_desc_newest_first(self, populated_db):
+        events = get_filtered_events(populated_db, sort_desc=True)
+        ids = [e['id'] for e in events]
+        assert ids == sorted(ids, reverse=True)
+
+    def test_sort_asc_oldest_first(self, populated_db):
+        events = get_filtered_events(populated_db, sort_desc=False)
+        ids = [e['id'] for e in events]
+        assert ids == sorted(ids)
+
+    def test_days_back_filters_old_events(self, temp_db):
+        """Events from now should appear; simulate via days_back=7."""
+        log_detection_event(
+            temp_db, 'recent.exe', 'b' * 64, 'PE',
+            512, 'Allaple.A', 0.9, 'cpu',
+        )
+        events = get_filtered_events(temp_db, days_back=7)
+        assert len(events) == 1
+        assert events[0]['file_name'] == 'recent.exe'
+
+    def test_combined_filters(self, populated_db):
+        """Family + confidence filter should AND together."""
+        events = get_filtered_events(
+            populated_db,
+            family_filter='Allaple.A',
+            min_confidence=0.90,
+        )
+        for e in events:
+            assert e['predicted_family'] == 'Allaple.A'
+            assert e['confidence'] >= 0.90
+
+    def test_returns_list_of_dicts(self, populated_db):
+        events = get_filtered_events(populated_db)
+        assert isinstance(events, list)
+        assert isinstance(events[0], dict)
+
+    def test_rows_contain_all_schema_columns(self, populated_db):
+        events = get_filtered_events(populated_db, limit=1)
+        required = {
+            'id', 'timestamp', 'file_name', 'sha256',
+            'file_format', 'file_size', 'predicted_family',
+            'confidence', 'device_used',
         }
-        assert expected.issubset(db.keys()), \
-            f"Missing families: {expected - db.keys()}"
+        assert required.issubset(events[0].keys())
 
-    def test_each_family_has_required_keys(self):
-        db = load_mitre_db()
-        for family, entry in db.items():
-            assert 'tactics' in entry,     f"{family} missing 'tactics'"
-            assert 'techniques' in entry,  f"{family} missing 'techniques'"
-            assert 'description' in entry, f"{family} missing 'description'"
-
-    def test_tactics_are_lists_of_strings(self):
-        db = load_mitre_db()
-        for family, entry in db.items():
-            assert isinstance(entry['tactics'], list), f"{family}: tactics must be list"
-            assert all(isinstance(t, str) for t in entry['tactics'])
-
-    def test_techniques_have_id_and_name(self):
-        db = load_mitre_db()
-        for family, entry in db.items():
-            for tech in entry['techniques']:
-                assert 'id' in tech,   f"{family}: technique missing 'id'"
-                assert 'name' in tech, f"{family}: technique missing 'name'"
-
-    def test_get_mitre_mapping_known_family(self):
-        result = get_mitre_mapping('Allaple.A')
-        assert result['found'] is True
-        assert len(result['tactics']) > 0
-        assert len(result['techniques']) > 0
-
-    def test_get_mitre_mapping_unknown_family(self):
-        result = get_mitre_mapping('UnknownFamily.XYZ')
-        assert result['found'] is False
-        assert result['tactics'] == []
-        assert result['techniques'] == []
-
-    def test_get_mitre_mapping_returns_required_keys(self):
-        result = get_mitre_mapping('Allaple.A')
-        assert 'found' in result
-        assert 'tactics' in result
-        assert 'techniques' in result
-        assert 'description' in result
-
-    def test_get_mitre_mapping_with_preloaded_db(self):
-        db = load_mitre_db()
-        result = get_mitre_mapping('Rbot!gen', db=db)
-        assert result['found'] is True
+    def test_no_sql_injection_via_family_filter(self, populated_db):
+        """Malicious family_filter string must not crash or return wrong rows."""
+        events = get_filtered_events(
+            populated_db,
+            family_filter="'; DROP TABLE detection_events; --",
+        )
+        # Should return empty list (no such family), not crash
+        assert isinstance(events, list)
+        # Table must still exist
+        remaining = get_filtered_events(populated_db)
+        assert len(remaining) == 10
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# JSON report
+# get_family_list
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestJsonReport:
-    def test_returns_bytes(self, sample_report_data):
-        result = generate_json_report(sample_report_data)
-        assert isinstance(result, bytes)
-        assert len(result) > 0
+class TestGetFamilyList:
+    def test_returns_list_with_all_families_prepended(self, populated_db):
+        families = get_family_list(populated_db)
+        assert families[0] == 'All Families'
 
-    def test_output_is_valid_json(self, sample_report_data):
-        result = generate_json_report(sample_report_data)
-        parsed = json.loads(result.decode('utf-8'))
-        assert isinstance(parsed, dict)
+    def test_returns_only_all_families_for_empty_db(self, temp_db):
+        families = get_family_list(temp_db)
+        assert families == ['All Families']
 
-    def test_contains_report_metadata(self, sample_report_data):
-        parsed = json.loads(generate_json_report(sample_report_data))
-        assert 'report_metadata' in parsed
-        assert 'generated_at' in parsed['report_metadata']
+    def test_returns_all_families_for_missing_db(self, tmp_path):
+        families = get_family_list(tmp_path / 'missing.db')
+        assert families == ['All Families']
 
-    def test_contains_file_information(self, sample_report_data):
-        parsed = json.loads(generate_json_report(sample_report_data))
-        fi = parsed['file_information']
-        assert fi['file_name'] == 'suspicious.exe'
-        assert fi['sha256'] == 'a' * 64
-        assert fi['file_format'] == 'PE'
-        assert fi['file_size_bytes'] == 2048
+    def test_families_are_sorted_alphabetically(self, populated_db):
+        families = get_family_list(populated_db)[1:]   # skip 'All Families'
+        assert families == sorted(families)
 
-    def test_contains_detection_result(self, sample_report_data):
-        parsed = json.loads(generate_json_report(sample_report_data))
-        dr = parsed['detection_result']
-        assert dr['predicted_family'] == 'Allaple.A'
-        assert abs(dr['confidence'] - 0.9312) < 1e-4
+    def test_no_duplicates(self, populated_db):
+        families = get_family_list(populated_db)
+        assert len(families) == len(set(families))
 
-    def test_top3_has_three_entries(self, sample_report_data):
-        parsed = json.loads(generate_json_report(sample_report_data))
-        assert len(parsed['detection_result']['top3_predictions']) == 3
+    def test_detected_families_present(self, populated_db):
+        families = get_family_list(populated_db)
+        assert 'Allaple.A' in families
+        assert 'Rbot!gen' in families
+        assert 'VB.AT' in families
 
-    def test_top3_entries_have_rank(self, sample_report_data):
-        parsed = json.loads(generate_json_report(sample_report_data))
-        ranks = [p['rank'] for p in parsed['detection_result']['top3_predictions']]
-        assert ranks == [1, 2, 3]
-
-    def test_contains_mitre_section(self, sample_report_data):
-        parsed = json.loads(generate_json_report(sample_report_data))
-        mitre = parsed['mitre_attack_ics']
-        assert mitre['mapping_found'] is True
-        assert 'tactics' in mitre
-        assert 'techniques' in mitre
-
-    def test_contains_explainability_section(self, sample_report_data):
-        parsed = json.loads(generate_json_report(sample_report_data))
-        xai = parsed['explainability']
-        assert 'gradcam_generated' in xai
-        assert xai['gradcam_generated'] is False
-
-    def test_gradcam_true_when_heatmap_present(self, sample_report_data):
-        sample_report_data['gradcam'] = {
-            'generated': True, 'target_class': 0, 'layer': 'Conv2d (block3.conv2)',
-        }
-        parsed = json.loads(generate_json_report(sample_report_data))
-        assert parsed['explainability']['gradcam_generated'] is True
-
-    def test_all_confidence_values_are_floats(self, sample_report_data):
-        parsed = json.loads(generate_json_report(sample_report_data))
-        conf = parsed['detection_result']['confidence']
-        assert isinstance(conf, float)
-
-    def test_output_is_utf8_decodable(self, sample_report_data):
-        result = generate_json_report(sample_report_data)
-        decoded = result.decode('utf-8')
-        assert len(decoded) > 0
-
-    def test_handles_missing_top3_gracefully(self, sample_report_data):
-        sample_report_data.pop('top3')
-        result = generate_json_report(sample_report_data)
-        parsed = json.loads(result)
-        assert parsed['detection_result']['top3_predictions'] == []
-
-    def test_returns_error_json_on_bad_input(self):
-        """Completely broken input should return error JSON, not raise."""
-        result = generate_json_report({})
-        parsed = json.loads(result)
-        # Either a valid report or an error dict — never raises
-        assert isinstance(parsed, dict)
+    def test_count_matches_distinct_families(self, populated_db):
+        # 3 distinct families + 'All Families' header
+        families = get_family_list(populated_db)
+        assert len(families) == 4
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PDF report
+# gallery helper functions
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestPdfReport:
-    def test_returns_bytes_when_fpdf2_available(self, sample_report_data):
-        if not FPDF2_AVAILABLE:
-            pytest.skip("fpdf2 not installed")
-        result = generate_pdf_report(sample_report_data)
-        assert result is not None
-        assert isinstance(result, bytes)
+class TestGalleryHelpers:
+    def test_load_family_names_returns_sorted_list(self, fake_dataset):
+        names = _load_family_names(str(fake_dataset))
+        assert names == sorted(names)
 
-    def test_output_starts_with_pdf_magic(self, sample_report_data):
-        if not FPDF2_AVAILABLE:
-            pytest.skip("fpdf2 not installed")
-        result = generate_pdf_report(sample_report_data)
-        assert result is not None
-        assert result[:4] == b'%PDF'
+    def test_load_family_names_all_three_present(self, fake_dataset):
+        names = _load_family_names(str(fake_dataset))
+        assert 'Allaple.A' in names
+        assert 'Rbot!gen' in names
+        assert 'VB.AT' in names
 
-    def test_output_is_nonempty(self, sample_report_data):
-        if not FPDF2_AVAILABLE:
-            pytest.skip("fpdf2 not installed")
-        result = generate_pdf_report(sample_report_data)
-        assert result is not None
-        assert len(result) > 1000   # any real PDF is at least 1KB
+    def test_load_family_names_missing_dir_returns_empty(self, tmp_path):
+        names = _load_family_names(str(tmp_path / 'nonexistent'))
+        assert names == []
 
-    def test_returns_none_when_fpdf2_missing(self, sample_report_data, monkeypatch):
-        """If FPDF2 is not importable, generate_pdf_report must return None."""
-        import modules.reporting.pdf_report as pr
-        monkeypatch.setattr(pr, 'FPDF2_AVAILABLE', False)
-        result = pr.generate_pdf_report(sample_report_data)
-        assert result is None
+    def test_load_sample_images_returns_arrays(self, fake_dataset):
+        images = _load_sample_images(str(fake_dataset), 'Allaple.A', max_images=5)
+        assert len(images) == 5
+        assert all(isinstance(img, np.ndarray) for img in images)
 
-    def test_does_not_raise_on_bad_input(self):
-        """Broken input must return None, never raise."""
-        if not FPDF2_AVAILABLE:
-            pytest.skip("fpdf2 not installed")
-        result = generate_pdf_report({})
-        assert result is None
+    def test_load_sample_images_respects_max_images(self, fake_dataset):
+        images = _load_sample_images(str(fake_dataset), 'Allaple.A', max_images=2)
+        assert len(images) == 2
 
-    def test_with_heatmap_bytes_embedded(self, sample_report_data):
-        """PDF with a heatmap PNG embedded must still succeed."""
-        if not FPDF2_AVAILABLE:
-            pytest.skip("fpdf2 not installed")
-        import io
-        import numpy as np
-        from PIL import Image
-        # Create a tiny valid PNG as fake heatmap
-        arr = np.zeros((128, 128, 3), dtype=np.uint8)
-        buf = io.BytesIO()
-        Image.fromarray(arr, 'RGB').save(buf, format='PNG')
-        fake_png = buf.getvalue()
+    def test_load_sample_images_missing_family_returns_empty(self, fake_dataset):
+        images = _load_sample_images(str(fake_dataset), 'NonexistentFamily', max_images=5)
+        assert images == []
 
-        sample_report_data['gradcam'] = {
-            'generated': True,
-            'target_class': 0,
-            'layer': 'Conv2d (block3.conv2)',
-            'overlay_png_bytes': fake_png,
-        }
-        result = generate_pdf_report(sample_report_data)
-        assert result is not None
-        assert result[:4] == b'%PDF'
-```
+    def test_load_sample_images_arrays_are_2d(self, fake_dataset):
+        images = _load_sample_images(str(fake_dataset), 'Allaple.A', max_images=3)
+        for img in images:
+            assert img.ndim == 2   # grayscale — no channel dimension
 
----
+    def test_load_sample_images_dtype_uint8(self, fake_dataset):
+        images = _load_sample_images(str(fake_dataset), 'Allaple.A', max_images=3)
+        for img in images:
+            assert img.dtype == np.uint8
 
-## Dependency Check
+    def test_count_family_images_correct(self, fake_dataset):
+        count = _count_family_images(str(fake_dataset), 'Allaple.A')
+        assert count == 5
 
-```bash
-# Verify fpdf2 is installed (not the old fpdf package)
-python -c "from fpdf import FPDF; print('fpdf2 OK')"
+    def test_count_family_images_missing_family_returns_zero(self, fake_dataset):
+        count = _count_family_images(str(fake_dataset), 'NoSuchFamily')
+        assert count == 0
 
-# If not installed:
-pip install fpdf2 --break-system-packages
-
-# Verify in requirements.txt:
-grep fpdf requirements.txt
-# Should show: fpdf2>=2.7.0
+    def test_corrupt_image_skipped_gracefully(self, fake_dataset):
+        """A corrupt PNG in the family dir should be skipped, not crash."""
+        corrupt = fake_dataset / 'Allaple.A' / 'corrupt.png'
+        corrupt.write_bytes(b'not a real image')
+        # Should load the 5 valid images, skip the corrupt one
+        images = _load_sample_images(str(fake_dataset), 'Allaple.A', max_images=10)
+        assert len(images) == 5   # corrupt skipped, 5 valid remain
 ```
 
 ---
@@ -1185,44 +810,47 @@ grep fpdf requirements.txt
 ## Definition of Done
 
 ```bash
-# Step 2 tests
-pytest tests/test_reporting.py -v
-# Expected: all tests pass (PDF tests skip gracefully if fpdf2 missing)
+# Step 3 tests
+pytest tests/test_gallery.py -v
+# Expected: all tests pass, 0 failures
+
+# Verify the SQL injection test specifically
+pytest tests/test_gallery.py::TestGetFilteredEvents::test_no_sql_injection_via_family_filter -v
 
 # Full regression suite
 pytest tests/ -v -m "not integration"
-# Expected: 0 failures across all phases
+# Expected: 0 failures across all phases + all steps
 
 # Import smoke tests
-python -c "from modules.reporting import generate_pdf_report, generate_json_report"
-python -c "from modules.reporting.mitre_mapper import get_mitre_mapping"
+python -c "from modules.dashboard.pages.gallery import render"
+python -c "from modules.dashboard.db import get_filtered_events, get_family_list"
 
-# Verify all 25 families are in the MITRE JSON
-python -c "
-from modules.reporting.mitre_mapper import load_mitre_db
-db = load_mitre_db()
-print(f'Families in MITRE DB: {len(db)}')
-assert len(db) == 25, f'Expected 25, got {len(db)}'
-print('OK')
-"
+# Dashboard launch — verify 5 pages load
+streamlit run modules/dashboard/app.py --server.port 8501
+# Navigate to each page and verify:
+#   ✓ 🏠 Dashboard — history table with filter expander renders
+#   ✓ 🖼️ Dataset Gallery — appears in sidebar
+#   ✓ Gallery shows info message when dataset missing (no crash)
+#   ✓ Gallery shows overview strip and detail grid when dataset present
 ```
 
 ### Checklist
 
-- [ ] `pytest tests/test_reporting.py -v` — 0 failures
+- [ ] `pytest tests/test_gallery.py -v` — 0 failures
 - [ ] All earlier tests still pass
-- [ ] `data/mitre_ics_mapping.json` exists with all 25 Malimg families
-- [ ] `modules/reporting/` package exists with 4 files
-- [ ] `config.py` has `REPORTS_DIR` defined
-- [ ] PDF button in dashboard is no longer `disabled=True`
-- [ ] Clicking "Generate PDF Report" → spinner → "Download PDF Report" button appears
-- [ ] PDF opens correctly in a browser PDF viewer
-- [ ] JSON report includes `mitre_attack_ics` section with tactics + techniques
-- [ ] JSON report includes `explainability.gradcam_generated` field
-- [ ] If Grad-CAM was run before PDF generation, heatmap is embedded in the PDF
-- [ ] `generate_pdf_report` returns `None` on failure — never raises
-- [ ] `generate_json_report` returns error JSON bytes on failure — never raises
-- [ ] `os.unlink(tmp_path)` in `generate_pdf_report` is inside a `finally` block
+- [ ] `modules/dashboard/pages/gallery.py` exists
+- [ ] `modules/dashboard/db.py` has `get_filtered_events()` and `get_family_list()`
+- [ ] `app.py` sidebar has 5 navigation options including `"🖼️ Dataset Gallery"`
+- [ ] `app.py` routes `"🖼️ Dataset Gallery"` to `gallery.render()`
+- [ ] `home.py` shows filterable history table (not just last-5 static rows)
+- [ ] History table has Family, Min Confidence, Time Range, Sort Order, Max Rows controls
+- [ ] History table has "Export to CSV" download button
+- [ ] Gallery page shows info message when `config.DATA_DIR` is missing (no crash)
+- [ ] Gallery uses `@st.cache_data(ttl=300)` on disk-read functions
+- [ ] Gallery uses `PIL.Image.open().convert('L')` — not cv2, not PyTorch
+- [ ] `get_filtered_events()` uses parameterised SQL (`?` placeholders) — no f-strings in SQL
+- [ ] `get_filtered_events()` returns empty list on any error — never raises
+- [ ] `get_family_list()` returns `['All Families']` when DB empty or missing
 
 ---
 
@@ -1230,15 +858,15 @@ print('OK')
 
 | Bug | Symptom | Fix |
 |---|---|---|
-| `import fpdf` instead of `from fpdf import FPDF` | `AttributeError` — old `fpdf` package has different API | Use `from fpdf import FPDF` (fpdf2) |
-| `pdf.output()` returns bytearray not bytes | Type error when writing to `st.download_button` | Wrap: `bytes(pdf.output())` |
-| Temp PNG file not deleted after PDF embed | Disk fills up over many reports | `os.unlink(tmp_path)` inside `finally` block |
-| `generate_pdf_report` raising on bad input | Dashboard page crashes | Wrap entire body in `try/except Exception: return None` |
-| MITRE family name case mismatch | `get_mitre_mapping` returns `found: False` for valid families | Keys in JSON must exactly match `class_names` from training (e.g. `Allaple.A` not `allaple.a`) |
-| Numpy float32 in `all_probabilities` | `json.dumps` raises `TypeError` | Cast all values: `round(float(v), 6)` |
-| `overlay_png_bytes` key missing from gradcam dict | KeyError when PDF tries to embed heatmap | Always check `gradcam.get('overlay_png_bytes')` before embedding |
-| `st.download_button` inside `st.button` callback | Streamlit renders button but click does nothing | Generate PDF bytes then immediately call `st.download_button` in same rerun |
+| f-string in SQL query | SQL injection vulnerability; also breaks on special chars in family names | Always use `?` placeholders and `params` list |
+| `@st.cache_data` on a function that returns PIL Images | Streamlit cache serialisation error | Cache returns numpy arrays or strings only — convert PIL → numpy before returning |
+| `img.ndim == 3` for grayscale PIL images | Shape is `(H, W, 1)` instead of `(H, W)` | Use `.convert('L')` then `np.array()` → always `(H, W)` |
+| Gallery crashing when dataset missing | `FileNotFoundError` propagates to Streamlit | Check `config.DATA_DIR.exists()` first, show `st.info()` and `return` |
+| `_load_family_names` called inside a cached function with `Path` arg | Cache miss every call (Path not hashable consistently) | Pass `str(config.DATA_DIR)` to cached functions, not `Path` objects |
+| `st.columns()` count mismatch with image count | IndexError on last row | Use `zip(cols, row_images)` — stops at shorter iterable automatically |
+| History filter widget keys colliding with other pages | Widget state bleeds across page navigations | Use unique `key=` strings like `"history_family_filter"` per widget |
+| CSV export encoding for non-ASCII family names | Garbled characters in Excel | Use `.encode('utf-8')` and `mime="text/csv"` — works for all family names |
 
 ---
 
-*Step 2 complete → move to Step 3: Dataset Gallery page + Detection History filtering.*
+*Step 3 complete → move to Step 4: Dynamic module status + FR1.1 live checks + FR1.3 navigation gating.*
