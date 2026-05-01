@@ -10,16 +10,16 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Repository root ────────────────────────────────────────────────────────────
+# ── Repository root ─────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent.resolve()
 
-# ── Paths ──────────────────────────────────────────────────────────────────────
+# ── Paths ───────────────────────────────────────────────────────────────────────
 DATA_DIR        = Path(os.getenv("MALTWIN_DATA_DIR",        str(BASE_DIR / "data/malimg")))
 PROCESSED_DIR   = Path(os.getenv("MALTWIN_PROCESSED_DIR",   str(BASE_DIR / "data/processed")))
 MODEL_DIR       = Path(os.getenv("MALTWIN_MODEL_DIR",       str(BASE_DIR / "models")))
 CHECKPOINT_DIR  = MODEL_DIR / "checkpoints"
 LOG_DIR         = Path(os.getenv("MALTWIN_LOG_DIR",         str(BASE_DIR / "logs")))
-REPORTS_DIR     = Path(os.getenv("MALTWIN_REPORTS_DIR",     str(BASE_DIR / "reports")))
+REPORTS_DIR     = Path(os.getenv("MALTWIN_REPORTS_DIR",     str(BASE_DIR / "data" / "reports")))
 MITRE_JSON_PATH  = BASE_DIR / "data" / "mitre_ics_mapping.json"
 CLASS_NAMES_PATH = PROCESSED_DIR / "class_names.json"
 DB_PATH          = LOG_DIR / "maltwin.db"
@@ -46,15 +46,15 @@ NUM_WORKERS  = int(os.getenv("MALTWIN_NUM_WORKERS",    "4"))
 TRAIN_RATIO = float(os.getenv("MALTWIN_TRAIN_RATIO", "0.70"))
 VAL_RATIO   = float(os.getenv("MALTWIN_VAL_RATIO",   "0.15"))
 TEST_RATIO  = float(os.getenv("MALTWIN_TEST_RATIO",  "0.15"))
-assert abs(TRAIN_RATIO + VAL_RATIO + TEST_RATIO - 1.0) < 1e-6, \
+assert abs(TRAIN_RATIO + VAL_RATIO + TEST_RATIO - 1.0) < 1e-6, 
     "MALTWIN_TRAIN_RATIO + MALTWIN_VAL_RATIO + MALTWIN_TEST_RATIO must equal 1.0"
 
-# ── Oversampler ────────────────────────────────────────────────────────────────
+# ── Oversampler ───────────────────────────────────────────────────────────────
 OVERSAMPLE_STRATEGY = os.getenv("MALTWIN_OVERSAMPLE_STRATEGY", "oversample_minority")
-assert OVERSAMPLE_STRATEGY in {"oversample_minority", "sqrt_inverse", "uniform"}, \
+assert OVERSAMPLE_STRATEGY in {"oversample_minority", "sqrt_inverse", "uniform"}, 
     f"MALTWIN_OVERSAMPLE_STRATEGY must be one of: oversample_minority, sqrt_inverse, uniform"
 
-# ── Reproducibility ────────────────────────────────────────────────────────────
+# ── Reproducibility ───────────────────────────────────────────────────────────
 RANDOM_SEED = int(os.getenv("MALTWIN_RANDOM_SEED", "42"))
 
 # ── Device ─────────────────────────────────────────────────────────────────────
@@ -72,7 +72,7 @@ ACCEPTED_EXTENSIONS = {".exe", ".dll", ".elf", ""}
 CONFIDENCE_GREEN = 0.80
 CONFIDENCE_AMBER = 0.50
 
-# ── Dashboard ─────────────────────────────────────────────────────────────────
+# ── Dashboard ──────────────────────────────────────────────────────────────────
 STREAMLIT_PORT  = 8501
 DASHBOARD_TITLE = "MalTwin — IIoT Malware Detection"
 
