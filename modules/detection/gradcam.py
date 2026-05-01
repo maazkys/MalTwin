@@ -185,16 +185,18 @@ def _heatmap_to_png(heatmap_array: np.ndarray) -> bytes:
         PNG bytes.
     """
     fig, ax = plt.subplots(figsize=(4, 4))
+    buf = io.BytesIO()
+    data = None
     try:
-        with io.BytesIO() as buf:
-            im = ax.imshow(heatmap_array, cmap='jet', vmin=0.0, vmax=1.0)
-            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-            ax.set_title('Grad-CAM Attribution', fontsize=10)
-            ax.axis('off')
-            plt.tight_layout()
-            plt.savefig(buf, format='PNG', dpi=100, bbox_inches='tight')
-            buf.seek(0)
-            data = buf.getvalue()
-        return data
+        im = ax.imshow(heatmap_array, cmap='jet', vmin=0.0, vmax=1.0)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        ax.set_title('Grad-CAM Attribution', fontsize=10)
+        ax.axis('off')
+        plt.tight_layout()
+        plt.savefig(buf, format='PNG', dpi=100, bbox_inches='tight')
+        buf.seek(0)
+        data = buf.getvalue()
     finally:
+        buf.close()
         plt.close(fig)  # mandatory — prevent memory leak
+    return data
