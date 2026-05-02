@@ -225,7 +225,7 @@ def _render_results() -> None:
         st.error(
             f"Error: Very low confidence for **{family}** detection "
             f"({confidence * 100:.1f}%). "
-            "Cause: Model confidence fell below the 50% threshold. "
+            f"Cause: Model confidence fell below the {config.CONFIDENCE_AMBER * 100:.0f}% threshold. "
             "Action: Perform a manual expert review before trusting this result."
         )
 
