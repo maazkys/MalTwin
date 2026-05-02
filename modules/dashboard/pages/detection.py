@@ -223,8 +223,10 @@ def _render_results() -> None:
         )
     else:
         st.error(
-            f"🔴 **{family}** detected with **{confidence * 100:.1f}%** confidence\n\n"
-            "Very low confidence — manual expert review is required."
+            f"Error: Very low confidence for **{family}** detection "
+            f"({confidence * 100:.1f}%). "
+            f"Cause: Model confidence fell below the {config.CONFIDENCE_AMBER * 100:.0f}% threshold. "
+            "Action: Perform a manual expert review before trusting this result."
         )
 
     confidence_pct = int(confidence * 100)

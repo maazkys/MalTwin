@@ -51,6 +51,30 @@ def configure_page() -> None:
     )
 
 
+def _check_network_binding() -> None:
+    """
+    SRS SEC-5: warn if dashboard is accessible on a non-localhost interface.
+    Streamlit exposes server address via its config at runtime.
+    """
+    try:
+        from streamlit import runtime
+        ctx = runtime.get_instance()
+        if ctx is None:
+            return
+        server_addr = os.environ.get('STREAMLIT_SERVER_ADDRESS', '127.0.0.1')
+        if server_addr not in ('localhost', '127.0.0.1', '::1'):
+            st.warning(
+                "⚠️ **Security Notice (SRS SEC-5):** "
+                "This dashboard is accessible on a non-localhost network interface "
+                f"(`{server_addr}`). "
+                "MalTwin is a research prototype and is not hardened for external exposure. "
+                "Ensure your network environment is trusted before proceeding.",
+                icon="🔒",
+            )
+    except Exception:
+        pass   # non-critical — never block startup
+
+
 def load_global_resources() -> None:
     """
     Load class names and model into session_state on first run.
@@ -185,6 +209,7 @@ def main() -> None:
     must precede every other Streamlit call.
     """
     configure_page()                        # ← st.set_page_config() happens here
+    _check_network_binding()
     state.init_session_state()
     init_db(config.DB_PATH)
     load_global_resources()
