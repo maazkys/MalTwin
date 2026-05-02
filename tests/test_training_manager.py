@@ -36,8 +36,9 @@ def fake_train_script(tmp_path) -> Path:
         print("[4/6] Training for 3 epochs...", flush=True)
         for epoch in range(1, 4):
             time.sleep(0.1)
-            print(f"Epoch {epoch:03d}/003 | Train Loss: 1.2345 | Val Acc: 0.{epoch*30:04d}", flush=True)
-            print(f"  ★ New best model saved (val_acc=0.{epoch*30:04d})", flush=True)
+            val_acc = 0.30 + epoch * 0.10
+            print(f"Epoch {epoch:03d}/003 | Train Loss: 1.2345 | Val Acc: {val_acc:.4f}", flush=True)
+            print(f"  ★ New best model saved (val_acc={val_acc:.4f})", flush=True)
         print("[5/6] Evaluating...", flush=True)
         print("[6/6] Saving outputs...", flush=True)
         print("Done!", flush=True)
@@ -93,7 +94,7 @@ class TestTrainingJobLifecycle:
             raising=False,
         )
 
-    def _run_to_completion(self, job: TrainingJob, timeout: float = 10.0) -> None:
+    def _run_to_completion(self, job: TrainingJob, timeout: float = 3.0) -> None:
         """Poll until job finishes or timeout expires."""
         start = time.time()
         while job.is_running():

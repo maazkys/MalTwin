@@ -31,6 +31,12 @@ _BATCH_SIZE_OPTIONS = [8, 16, 32, 64, 128]
 _OVERSAMPLE_OPTIONS = ['oversample_minority', 'sqrt_inverse', 'uniform']
 
 
+def get_training_state() -> TrainingJobState | None:
+    """Returns TrainingJobState or None."""
+    job = st.session_state.get(state.KEY_TRAINING_JOB)
+    return job.state if job else None
+
+
 def render():
     st.title("🏋️ Model Training")
     st.markdown(
@@ -251,7 +257,7 @@ def _render_log_panel() -> None:
     # ── Live log ──────────────────────────────────────────────────────────────
     st.markdown("**Output:**")
     log_text = '\n'.join(training_state.log_lines[-_MAX_LOG_LINES:])
-    st.code(log_text or "(no output yet)", language=None)
+    st.code(log_text or "(no output yet)")
 
     # ── Output files ──────────────────────────────────────────────────────────
     if training_state.status == 'completed':
@@ -377,8 +383,3 @@ def _mark_model_reloaded() -> None:
         job.state.model_reloaded = True
         st.session_state[state.KEY_TRAINING_STATE] = asdict(job.state)
 
-
-# Re-export for state.py helper
-def get_training_state() -> TrainingJobState | None:
-    job = st.session_state.get(state.KEY_TRAINING_JOB)
-    return job.state if job else None

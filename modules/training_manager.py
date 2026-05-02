@@ -110,7 +110,6 @@ class TrainingJob:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,               # line-buffered
-            cwd=Path.cwd(),
         )
 
         args_used = dict(args)
