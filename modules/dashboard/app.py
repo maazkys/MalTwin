@@ -95,10 +95,11 @@ def render_sidebar() -> str:
     model_ready   = state.is_model_loaded()
     file_ready    = state.has_uploaded_file()
     dataset_ready = False
-    try:
-        dataset_ready = config.DATA_DIR.exists() and any(config.DATA_DIR.iterdir())
-    except Exception:
-        dataset_ready = False
+    if config.DATA_DIR.exists():
+        try:
+            dataset_ready = any(config.DATA_DIR.iterdir())
+        except Exception:
+            dataset_ready = False
 
     # Build options with availability markers
     # Format: (display_label, internal_key, is_available)

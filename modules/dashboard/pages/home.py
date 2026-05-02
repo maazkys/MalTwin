@@ -142,15 +142,15 @@ def _render_module_status() -> None:
 
     df = pd.DataFrame(rows)
 
-    # Colour-code the Status column
-    def _colour_status(val: str) -> str:
+    # Color-code the Status column
+    def _color_status(val: str) -> str:
         if '✅' in val:
             return 'color: #3cb371; font-weight: bold'
         if '⚠️' in val:
             return 'color: #e6a21e; font-weight: bold'
         return 'color: #d23232; font-weight: bold'
 
-    styled = df.style.map(_colour_status, subset=['Status'])
+    styled = df.style.map(_color_status, subset=['Status'])
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
     # Summary counts
