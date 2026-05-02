@@ -12,6 +12,7 @@ Layout:
 Training runs scripts/train.py as a subprocess. This page never imports
 PyTorch directly — all ML work happens in the subprocess.
 """
+import re
 import time
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -29,6 +30,7 @@ _POLL_INTERVAL_S = 2      # seconds between auto-reruns while training
 _MAX_LOG_LINES   = 300    # cap displayed log lines to avoid massive DOM
 _BATCH_SIZE_OPTIONS = [8, 16, 32, 64, 128]
 _OVERSAMPLE_OPTIONS = ['oversample_minority', 'sqrt_inverse', 'uniform']
+_INITIAL_PROGRESS = 0.05
 
 
 def render():
@@ -346,7 +348,7 @@ def _estimate_progress(log_lines: list[str], total_epochs: int) -> float:
             except (IndexError, ValueError):
                 continue
     if last_epoch == 0:
-        return 0.05
+        return _INITIAL_PROGRESS
     return min(last_epoch / total_epochs, 1.0)
 
 
@@ -357,14 +359,15 @@ def _parse_best_val_acc(log_lines: list[str]) -> float | None:
     """
     best = None
     for line in log_lines:
-        if 'val_acc=' in line:
-            try:
-                val_str = line.split('val_acc=')[1].strip().rstrip(')')
-                val = float(val_str)
-                if best is None or val > best:
-                    best = val
-            except (IndexError, ValueError):
-                continue
+        match = re.search(r"val_acc=([\d.]+)", line)
+        if not match:
+            continue
+        try:
+            val = float(match.group(1))
+            if best is None or val > best:
+                best = val
+        except ValueError:
+            continue
     return best
 
 
