@@ -35,30 +35,41 @@ Binary (.exe / .dll / ELF)
 - **25-family CNN classifier** — 3-block ConvNet trained on the Malimg dataset with weighted oversampling to handle class imbalance
 - **Confidence-coded results** — green / amber / red UI based on prediction confidence thresholds
 - **MITRE ATT&CK for ICS mapping** — tactics and techniques for each detected malware family
-- **Detection history** — all events logged to SQLite with timestamp, SHA-256, confidence, and device used
+- **Detection history** — SQLite log with CSV export and filtering
 - **Grad-CAM XAI** — heatmap overlays that highlight which byte regions drove a prediction
-- **Forensic reporting** — PDF + JSON report downloads with MITRE mappings
+- **Forensic reporting** — PDF + JSON exports with MITRE mappings and optional Grad-CAM embeds
+- **Dataset gallery** — per-family image grids with MITRE context
+- **Training manager** — run model training from the dashboard with live logs and progress
+- **System health checks** — module status + CPU/RAM metrics in the dashboard
 - **Streamlit dashboard** — six-page web UI (overview, upload, detection, gallery, training, digital twin stub)
-- **CLI tools** — standalone scripts for training, evaluation, and binary conversion
+- **CLI & utilities** — training, evaluation, binary conversion, synthetic data generation, MITRE verification
 
 ---
 
 ## Repository Structure
 
 ```
-maltwin/
+MalTwin/
+├── README.md
 ├── config.py                        # Central config — all paths and hyperparameters
+├── conftest.py                      # Pytest path setup for project root
 ├── requirements.txt
 ├── .env.example                     # Copy to .env and edit before running
+├── Implement.md                     # Implementation walkthrough + test notes
+├── SRS_COMPLIANCE.md                # SRS traceability matrix
+├── MalTwin_SRS.pdf                  # SRS document
+├── MalTwin_Testing_Documentation.docx
+├── verify_mitre.py                  # Validate MITRE mapping vs class_names.json
 │
 ├── modules/
+│   ├── __init__.py
 │   ├── binary_to_image/
 │   │   ├── converter.py             # BinaryConverter — bytes → 128×128 numpy array
 │   │   └── utils.py                 # validate_binary_format, compute_sha256, histogram
 │   │
 │   ├── dataset/
 │   │   ├── loader.py                # MalimgDataset (PyTorch), get_dataloaders()
-│   │   └── preprocessor.py         # validate_dataset_integrity, encode_labels, etc.
+│   │   └── preprocessor.py          # validate_dataset_integrity, encode_labels, etc.
 │   │
 │   ├── enhancement/
 │   │   ├── augmentor.py             # get_train_transforms, get_val_transforms, GaussianNoise
@@ -68,44 +79,63 @@ maltwin/
 │   │   ├── model.py                 # MalTwinCNN (ConvBlock × 3 + classifier)
 │   │   ├── trainer.py               # train(), validate_epoch()
 │   │   ├── evaluator.py             # evaluate(), plot_confusion_matrix()
-│   │   └── inference.py             # load_model(), predict_single(), predict_batch()
+│   │   ├── inference.py             # load_model(), predict_single(), predict_batch()
+│   │   └── gradcam.py               # Grad-CAM heatmap generator
 │   │
-│   └── dashboard/
-│       ├── app.py                   # Streamlit entry point + navigation routing
-│       ├── db.py                    # SQLite helpers (WAL mode, init, log, query)
-│       ├── state.py                 # session_state key constants + helpers
-│       └── pages/
-│           ├── home.py              # KPI cards, activity chart, module status
-│           ├── upload.py            # File uploader, visualisation, histogram
-│           ├── detection.py         # Run inference, probability chart, MITRE mapping
-│           ├── gallery.py           # Dataset gallery and MITRE context
-│           ├── training.py          # Model training UI
-│           └── digital_twin.py      # Stub (Module 1 deferred)
+│   ├── reporting/
+│   │   ├── json_report.py           # JSON forensic report builder
+│   │   ├── pdf_report.py            # PDF forensic report (FPDF2)
+│   │   └── mitre_mapper.py          # MITRE mapping loader
+│   │
+│   ├── dashboard/
+│   │   ├── app.py                   # Streamlit entry point + navigation routing
+│   │   ├── db.py                    # SQLite helpers (WAL mode, init, log, query)
+│   │   ├── health.py                # Module health + system stats
+│   │   ├── state.py                 # session_state key constants + helpers
+│   │   └── pages/
+│   │       ├── home.py              # KPI cards, activity chart, module status
+│   │       ├── upload.py            # File uploader, visualisation, histogram
+│   │       ├── detection.py         # Run inference, probability chart, MITRE mapping
+│   │       ├── gallery.py           # Dataset gallery and MITRE context
+│   │       ├── training.py          # Model training UI
+│   │       └── digital_twin.py      # Stub (Module 1 deferred)
+│   │
+│   └── training_manager.py          # Subprocess-based training runner
 │
 ├── scripts/
+│   ├── __init__.py
 │   ├── train.py                     # Full training pipeline (validate → train → evaluate)
 │   ├── evaluate.py                  # Test-set evaluation only (no retraining)
-│   └── convert_binary.py            # Convert a single binary to PNG via CLI
+│   ├── convert_binary.py            # Convert a single binary to PNG via CLI
+│   └── generate_data.py             # Synthetic binary generator
 │
 ├── data/
 │   ├── malimg/                      # ← Download dataset here (not in git)
-│   ├── processed/                   # class_names.json, eval_metrics.json (generated)
+│   ├── processed/                   # class_names.json, eval_metrics.json, confusion_matrix.png (generated)
+│   ├── logs/                        # Sample SQLite DB snapshot (optional)
 │   └── mitre_ics_mapping.json       # Static MITRE ATT&CK ICS reference data
 │
 ├── models/
 │   ├── best_model.pt                # Best checkpoint by val accuracy (generated)
 │   └── checkpoints/                 # Per-epoch checkpoints (generated)
 │
-├── logs/
-│   └── maltwin.db                   # SQLite detection event log (generated)
+├── logs/                            # Runtime SQLite detection log (configurable)
+├── reports/                         # Generated PDF/JSON reports (configurable)
 │
 └── tests/
+    ├── __init__.py
     ├── conftest.py                  # Shared pytest fixtures
     ├── test_converter.py
     ├── test_dataset.py
     ├── test_enhancement.py
     ├── test_model.py
     ├── test_db.py
+    ├── test_gallery.py
+    ├── test_gradcam.py
+    ├── test_health.py
+    ├── test_reporting.py
+    ├── test_training_manager.py
+    ├── test_integration.py
     └── fixtures/
         ├── sample_pe.exe            # Minimal valid PE (1024 bytes, MZ header)
         └── sample_elf               # Minimal valid ELF (1024 bytes, \x7fELF header)
@@ -232,6 +262,20 @@ python scripts/evaluate.py --save-metrics
 python scripts/convert_binary.py --input suspicious.exe --output output.png
 ```
 
+### Utility scripts
+
+Generate synthetic test binaries into `MALTWIN_DATA_DIR`:
+
+```bash
+python scripts/generate_data.py --families Mirai_Synthetic Gafgyt_Synthetic Benign_IoT --count 50
+```
+
+Validate MITRE mappings against `data/processed/class_names.json`:
+
+```bash
+python verify_mitre.py
+```
+
 ---
 
 ## Training Options
@@ -298,15 +342,24 @@ Integration tests are marked `@pytest.mark.integration` and require the Malimg d
 
 ---
 
+## Documentation & References
+
+- **Implement.md** — implementation walkthrough, design notes, and test execution logs
+- **SRS_COMPLIANCE.md** — requirements traceability matrix against the SRS
+- **MalTwin_SRS.pdf** — full Software Requirements Specification document
+- **MalTwin_Testing_Documentation.docx** — formal testing documentation and results
+
+---
+
 ## Dashboard Pages
 
 | Page | Description |
 |------|-------------|
-| 🏠 Dashboard | KPI cards (total analyzed, malware count, model accuracy), 7-day activity chart, recent detections feed, module status table |
+| 🏠 Dashboard | KPI cards (total analyzed, malware count, model accuracy), 7-day activity chart, detection history with filters + CSV export, system stats, module status |
 | 📂 Binary Upload | Upload `.exe` or `.dll`, validates format, converts to 128×128 greyscale image, displays metadata table and pixel intensity histogram |
 | 🔍 Malware Detection | Run CNN inference on the uploaded binary, shows predicted family with confidence bar (green/amber/red), top-3 predictions, full 25-class probability chart, MITRE ATT&CK for ICS mapping, PDF/JSON report export |
 | 🖼️ Dataset Gallery | Per-family gallery with MITRE context expander |
-| 🏋️ Model Training | Configure and run training from the dashboard |
+| 🏋️ Model Training | Configure and run training from the dashboard with live logs and progress |
 | 🖥️ Digital Twin | Stub page — Module 1 (Docker/Mininet IIoT simulation) is deferred to a future sprint |
 
 ---
@@ -318,6 +371,10 @@ All settings live in `.env` (copied from `.env.example`). `config.py` reads them
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MALTWIN_DATA_DIR` | `./data/malimg` | Malimg dataset root |
+| `MALTWIN_PROCESSED_DIR` | `./data/processed` | Processed artifacts (class_names, metrics, confusion matrix) |
+| `MALTWIN_MODEL_DIR` | `./models` | Model checkpoints and best model path |
+| `MALTWIN_LOG_DIR` | `./logs` | SQLite detection database directory |
+| `MALTWIN_REPORTS_DIR` | `./reports` | PDF/JSON report output directory |
 | `MALTWIN_IMG_SIZE` | `128` | Output image size (N×N) |
 | `MALTWIN_BATCH_SIZE` | `32` | Training batch size |
 | `MALTWIN_EPOCHS` | `30` | Training epochs |
