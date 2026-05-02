@@ -31,12 +31,6 @@ _BATCH_SIZE_OPTIONS = [8, 16, 32, 64, 128]
 _OVERSAMPLE_OPTIONS = ['oversample_minority', 'sqrt_inverse', 'uniform']
 
 
-def get_training_state() -> TrainingJobState | None:
-    """Returns TrainingJobState or None."""
-    job = st.session_state.get(state.KEY_TRAINING_JOB)
-    return job.state if job else None
-
-
 def render():
     st.title("🏋️ Model Training")
     st.markdown(
@@ -182,7 +176,7 @@ def _render_config_panel() -> None:
 
     # Config summary (shown while running)
     if is_running:
-        training_state = get_training_state()
+        training_state = state.get_training_state()
         if training_state and training_state.args_used:
             st.markdown("**Running with:**")
             for k, v in training_state.args_used.items():
@@ -208,7 +202,8 @@ def _render_log_panel() -> None:
     # ── Status banner ─────────────────────────────────────────────────────────
     if training_state.status == 'running':
         st.success(
-            f"🟢 Training in progress — started {training_state.start_time[:19]} UTC"
+            "🟢 Training in progress — started "
+            f"{_format_timestamp(training_state.start_time)} UTC"
         )
 
         # Elapsed time
@@ -232,8 +227,8 @@ def _render_log_panel() -> None:
 
     elif training_state.status == 'completed':
         st.success(
-            f"✅ Training completed successfully "
-            f"(exit code 0) — finished {training_state.end_time[:19]} UTC"
+            "✅ Training completed successfully "
+            f"(exit code 0) — finished {_format_timestamp(training_state.end_time)} UTC"
         )
         # Reload model into session state automatically
         _reload_model_after_training()
@@ -246,7 +241,7 @@ def _render_log_panel() -> None:
 
     elif training_state.status == 'stopped':
         st.warning(
-            f"⚠️ Training stopped by user — {training_state.end_time[:19]} UTC"
+            f"⚠️ Training stopped by user — {_format_timestamp(training_state.end_time)} UTC"
         )
 
     # ── Metrics extraction (parse log for best val_acc) ───────────────────────
@@ -373,6 +368,17 @@ def _parse_best_val_acc(log_lines: list[str]) -> float | None:
     return best
 
 
+def _format_timestamp(iso_timestamp: str) -> str:
+    """Format ISO timestamps for display."""
+    try:
+        parsed = datetime.fromisoformat(iso_timestamp)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.strftime("%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return iso_timestamp
+
+
 def _update_training_snapshot(job: TrainingJob) -> None:
     st.session_state[state.KEY_TRAINING_STATE] = asdict(job.state)
 
@@ -382,4 +388,3 @@ def _mark_model_reloaded() -> None:
     if job:
         job.state.model_reloaded = True
         st.session_state[state.KEY_TRAINING_STATE] = asdict(job.state)
-

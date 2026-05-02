@@ -109,7 +109,7 @@ class TrainingJob:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            bufsize=1,               # line-buffered
+            bufsize=1,               # text-mode buffering; reader thread pulls line-by-line
         )
 
         args_used = dict(args)
@@ -194,7 +194,6 @@ class TrainingJob:
         return self._process.poll() is None
 
 
-# ── Module-level singleton ─────────────────────────────────────────────────────
-# One TrainingJob per Python process — Streamlit reruns share this instance
-# via session_state (the TrainingJob object is stored there, not recreated).
-# Do NOT instantiate at module level — let the page create it.
+# ── Usage note ────────────────────────────────────────────────────────────────
+# Store the TrainingJob instance in Streamlit session_state so it persists
+# across reruns. Do NOT instantiate at module level — let the page create it.

@@ -51,7 +51,11 @@ def fake_train_script(tmp_path) -> Path:
 def fail_train_script(tmp_path) -> Path:
     """Script that exits with code 1 immediately."""
     script = tmp_path / "fail_train.py"
-    script.write_text("import sys; print('ERROR: Dataset not found', flush=True); sys.exit(1)")
+    script.write_text(textwrap.dedent("""
+        import sys
+        print('ERROR: Dataset not found', flush=True)
+        sys.exit(1)
+    """))
     return script
 
 
