@@ -131,8 +131,8 @@ class TrainingJob:
         try:
             for line in self._process.stdout:
                 self._queue.put(line.rstrip('\n'))
-        except Exception:
-            pass
+        except (OSError, ValueError) as exc:
+            self._queue.put(f"[training_manager] Output reader error: {exc}")
         finally:
             self._queue.put(None)   # sentinel — signals EOF
 
@@ -183,8 +183,8 @@ class TrainingJob:
                 self._process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self._process.kill()
-        except Exception:
-            pass
+        except (ProcessLookupError, OSError) as exc:
+            self.state.error_msg = f"Failed to stop process: {exc}"
         self.state.status = 'stopped'
         self.state.end_time = datetime.now(timezone.utc).isoformat()
 

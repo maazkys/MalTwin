@@ -207,7 +207,7 @@ def _render_log_panel() -> None:
             elapsed = datetime.now(timezone.utc) - started
             mins, secs = divmod(int(elapsed.total_seconds()), 60)
             st.caption(f"Elapsed: {mins}m {secs}s")
-        except Exception:
+        except (ValueError, TypeError):
             pass
 
         st.progress(
@@ -274,7 +274,11 @@ def _start_training(args: dict) -> None:
     except RuntimeError as e:
         st.error(f"Error: {e}")
     except Exception as e:
-        st.error(f"Error: Failed to start training. Cause: {e}")
+        st.error(
+            "Error: Failed to start training. "
+            f"Cause: {e}. "
+            "Action: Verify hyperparameters, dependencies, and file permissions, then try again."
+        )
 
 
 def _reload_model_after_training() -> None:
