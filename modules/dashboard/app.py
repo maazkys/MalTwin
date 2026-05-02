@@ -83,25 +83,58 @@ def load_global_resources() -> None:
 
 def render_sidebar() -> str:
     """
-    Render sidebar navigation. Returns the selected page label string.
+    Render sidebar navigation with availability indicators.
+    Returns the selected page label string.
+    Greyed-out pages are shown with ⚠️ prefix in the selectbox.
     """
     st.sidebar.markdown("# 🛡️ MalTwin")
     st.sidebar.markdown("*IIoT Malware Detection*")
     st.sidebar.divider()
 
-    page = st.sidebar.radio(
-        "Navigation",
-        options=[
-            "🏠 Dashboard",
-            "📂 Binary Upload",
+    # Determine which pages are available
+    model_ready   = state.is_model_loaded()
+    file_ready    = state.has_uploaded_file()
+    dataset_ready = False
+    if config.DATA_DIR.exists():
+        try:
+            dataset_ready = any(config.DATA_DIR.iterdir())
+        except Exception:
+            dataset_ready = False
+
+    # Build options with availability markers
+    # Format: (display_label, internal_key, is_available)
+    nav_options = [
+        ("🏠 Dashboard",        "🏠 Dashboard",        True),
+        ("📂 Binary Upload",    "📂 Binary Upload",    True),
+        (
+            "🔍 Malware Detection" if (model_ready and file_ready)
+            else "🔍 Malware Detection ⚠️",
             "🔍 Malware Detection",
+            True,     # always selectable — shows its own guard message
+        ),
+        (
+            "🖼️ Dataset Gallery" if dataset_ready
+            else "🖼️ Dataset Gallery ⚠️",
             "🖼️ Dataset Gallery",
-            "🖥️ Digital Twin",
-        ],
+            True,     # always selectable — gallery shows its own info message
+        ),
+        ("🖥️ Digital Twin",    "🖥️ Digital Twin",     True),
+    ]
+
+    display_labels  = [opt[0] for opt in nav_options]
+    internal_keys   = [opt[1] for opt in nav_options]
+
+    selected_display = st.sidebar.radio(
+        "Navigation",
+        options=display_labels,
         label_visibility="hidden",
     )
 
-    # ── System status ─────────────────────────────────────────────────────────
+    # Map display label back to internal key (strips ⚠️ suffix)
+    selected_index = display_labels.index(selected_display)
+    page = internal_keys[selected_index]
+
+    # ── System status panel ───────────────────────────────────────────────────
     st.sidebar.divider()
     st.sidebar.markdown("**System Status**")
 
@@ -121,6 +154,17 @@ def render_sidebar() -> str:
     if state.has_detection_result():
         result = st.session_state[state.KEY_DETECTION]
         st.sidebar.success(f"🎯 {result['predicted_family']}")
+
+    # ── Module health summary (compact) ──────────────────────────────────────
+    st.sidebar.divider()
+    try:
+        from modules.dashboard.health import get_all_module_statuses
+        statuses  = get_all_module_statuses()
+        n_active  = sum(1 for s in statuses if s['status'] == 'active')
+        n_total   = len(statuses)
+        st.sidebar.caption(f"Modules: {n_active}/{n_total} active")
+    except Exception:
+        pass
 
     # ── Footer ────────────────────────────────────────────────────────────────
     st.sidebar.divider()

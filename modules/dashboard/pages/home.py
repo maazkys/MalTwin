@@ -49,11 +49,21 @@ def render():
         _render_activity_chart(config.DB_PATH)
 
     with col_right:
-        st.subheader("Digital Twin Status")
-        st.info("🖥️ Digital Twin simulation is in a future implementation phase.")
-        st.markdown("**Status:** Not Configured")
-        st.markdown("**Active Nodes:** —")
-        st.markdown("**Traffic Flow:** —")
+        st.subheader("System Resources")
+        from modules.dashboard.health import get_system_stats
+        stats = get_system_stats()
+
+        if stats['error']:
+            st.caption("System stats unavailable (psutil error).")
+        else:
+            st.metric("CPU Usage",    f"{stats['cpu_pct']:.1f}%")
+            st.metric("RAM Usage",    f"{stats['mem_pct']:.1f}%")
+            st.metric(
+                "RAM Used",
+                f"{stats['mem_used_gb']:.1f} / {stats['mem_total_gb']:.1f} GB",
+            )
+            st.metric("Device",       stats['device'].upper())
+            st.metric("Dashboard Up", stats['uptime_str'])
 
     st.markdown("---")
 
@@ -110,21 +120,50 @@ def _render_activity_chart(db_path):
     st.plotly_chart(fig, use_container_width=True)
 
 
-def _render_module_status():
-    """Render a static table showing the implementation status of all 8 modules."""
-    model_status = "✅ Active" if config.BEST_MODEL_PATH.exists() else "⚠️ No model trained"
-    modules = [
-        ("M1", "Digital Twin Simulation",      "⚠️ Deferred — future sprint"),
-        ("M2", "Binary-to-Image Conversion",   "✅ Active"),
-        ("M3", "Dataset & Preprocessing",      "✅ Active"),
-        ("M4", "Data Enhancement & Balancing", "✅ Active"),
-        ("M5", "Malware Detection (CNN)",       model_status),
-        ("M6", "Dashboard & Visualization",    "✅ Active"),
-        ("M7", "Explainable AI (Grad-CAM)",    "⚠️ Deferred — future sprint"),
-        ("M8", "Automated Threat Reporting",   "⚠️ Deferred — future sprint"),
+def _render_module_status() -> None:
+    """
+    Render the live module status table using health.py checks.
+    SRS ref: FR1.1 — refreshes automatically (via st.cache_data ttl=30s).
+    """
+    import pandas as pd
+    from modules.dashboard.health import get_all_module_statuses
+
+    statuses = get_all_module_statuses()
+
+    rows = [
+        {
+            'ID':     s['id'],
+            'Module': s['name'],
+            'Status': f"{s['emoji']} {s['status'].capitalize()}",
+            'Detail': s['detail'],
+        }
+        for s in statuses
     ]
-    df = pd.DataFrame(modules, columns=["ID", "Module", "Status"])
-    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    df = pd.DataFrame(rows)
+
+    # Color-code the Status column
+    def _color_status(val: str) -> str:
+        if '✅' in val:
+            return 'color: #3cb371; font-weight: bold'
+        if '⚠️' in val:
+            return 'color: #e6a21e; font-weight: bold'
+        return 'color: #d23232; font-weight: bold'
+
+    styled = df.style.map(_color_status, subset=['Status'])
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    # Summary counts
+    n_active   = sum(1 for s in statuses if s['status'] == 'active')
+    n_inactive = sum(1 for s in statuses if s['status'] == 'inactive')
+    n_error    = sum(1 for s in statuses if s['status'] == 'error')
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("✅ Active",   n_active)
+    col2.metric("⚠️ Inactive", n_inactive)
+    col3.metric("🔴 Error",    n_error)
+
+    st.caption("Status refreshes every 30 seconds automatically.")
 
 
 def _render_history_section() -> None:
