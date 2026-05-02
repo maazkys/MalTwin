@@ -69,8 +69,8 @@ MAX_UPLOAD_BYTES    = 50 * 1024 * 1024   # 50 MB
 ACCEPTED_EXTENSIONS = {".exe", ".dll", ".elf", ""}
 
 # ── Confidence thresholds for UI color coding ──────────────────────────────────
-CONFIDENCE_GREEN = 0.80
-CONFIDENCE_AMBER = 0.50
+CONFIDENCE_GREEN = float(os.getenv('MALTWIN_CONFIDENCE_GREEN', '0.80'))
+CONFIDENCE_AMBER = float(os.getenv('MALTWIN_CONFIDENCE_AMBER', '0.50'))
 
 # ── Dashboard ──────────────────────────────────────────────────────────────────
 STREAMLIT_PORT  = 8501

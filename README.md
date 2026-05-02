@@ -36,7 +36,9 @@ Binary (.exe / .dll / ELF)
 - **Confidence-coded results** — green / amber / red UI based on prediction confidence thresholds
 - **MITRE ATT&CK for ICS mapping** — tactics and techniques for each detected malware family
 - **Detection history** — all events logged to SQLite with timestamp, SHA-256, confidence, and device used
-- **Streamlit dashboard** — four-page web UI (overview, upload, detection, digital twin stub)
+- **Grad-CAM XAI** — heatmap overlays that highlight which byte regions drove a prediction
+- **Forensic reporting** — PDF + JSON report downloads with MITRE mappings
+- **Streamlit dashboard** — six-page web UI (overview, upload, detection, gallery, training, digital twin stub)
 - **CLI tools** — standalone scripts for training, evaluation, and binary conversion
 
 ---
@@ -76,6 +78,8 @@ maltwin/
 │           ├── home.py              # KPI cards, activity chart, module status
 │           ├── upload.py            # File uploader, visualisation, histogram
 │           ├── detection.py         # Run inference, probability chart, MITRE mapping
+│           ├── gallery.py           # Dataset gallery and MITRE context
+│           ├── training.py          # Model training UI
 │           └── digital_twin.py      # Stub (Module 1 deferred)
 │
 ├── scripts/
@@ -300,7 +304,9 @@ Integration tests are marked `@pytest.mark.integration` and require the Malimg d
 |------|-------------|
 | 🏠 Dashboard | KPI cards (total analyzed, malware count, model accuracy), 7-day activity chart, recent detections feed, module status table |
 | 📂 Binary Upload | Upload `.exe` or `.dll`, validates format, converts to 128×128 greyscale image, displays metadata table and pixel intensity histogram |
-| 🔍 Malware Detection | Run CNN inference on the uploaded binary, shows predicted family with confidence bar (green/amber/red), top-3 predictions, full 25-class probability chart, MITRE ATT&CK for ICS mapping, JSON export |
+| 🔍 Malware Detection | Run CNN inference on the uploaded binary, shows predicted family with confidence bar (green/amber/red), top-3 predictions, full 25-class probability chart, MITRE ATT&CK for ICS mapping, PDF/JSON report export |
+| 🖼️ Dataset Gallery | Per-family gallery with MITRE context expander |
+| 🏋️ Model Training | Configure and run training from the dashboard |
 | 🖥️ Digital Twin | Stub page — Module 1 (Docker/Mininet IIoT simulation) is deferred to a future sprint |
 
 ---
@@ -325,6 +331,8 @@ All settings live in `.env` (copied from `.env.example`). `config.py` reads them
 | `MALTWIN_TEST_RATIO` | `0.15` | Test split fraction |
 | `MALTWIN_OVERSAMPLE_STRATEGY` | `oversample_minority` | `oversample_minority`, `sqrt_inverse`, `uniform` |
 | `MALTWIN_RANDOM_SEED` | `42` | Global random seed |
+| `MALTWIN_CONFIDENCE_GREEN` | `0.80` | Green confidence threshold for UI |
+| `MALTWIN_CONFIDENCE_AMBER` | `0.50` | Amber confidence threshold for UI |
 
 ---
 
@@ -338,8 +346,8 @@ All settings live in `.env` (copied from `.env.example`). `config.py` reads them
 | M5 — Malware Detection CNN | ✅ Complete | Requires training run |
 | M6 — Dashboard & Visualization | ✅ Complete | |
 | M1 — Digital Twin Simulation | ⚠️ Deferred | Requires Docker + Mininet infrastructure |
-| M7 — Explainable AI (Grad-CAM) | ⚠️ Deferred | `gradcam_layer` hook point already in model |
-| M8 — Automated Threat Reporting | ⚠️ Deferred | PDF export button stubbed in dashboard |
+| M7 — Explainable AI (Grad-CAM) | ✅ Complete | Captum heatmap pipeline with overlay export |
+| M8 — Automated Threat Reporting | ✅ Complete | PDF + JSON export with MITRE mapping |
 
 ---
 
