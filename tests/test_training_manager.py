@@ -33,7 +33,7 @@ def fake_train_script(tmp_path) -> Path:
         print("  Families found:   25", flush=True)
         print("[2/6] Building DataLoaders...", flush=True)
         print("[3/6] Initialising model...", flush=True)
-        print("[4/6] Training for 3 epoch(s)...", flush=True)
+        print("[4/6] Training for 3 epochs...", flush=True)
         for epoch in range(1, 4):
             time.sleep(0.1)
             print(f"Epoch {epoch:03d}/003 | Train Loss: 1.2345 | Val Acc: 0.{epoch*30:04d}", flush=True)

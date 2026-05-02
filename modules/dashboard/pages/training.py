@@ -14,7 +14,7 @@ PyTorch directly — all ML work happens in the subprocess.
 """
 import time
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone
 
 import streamlit as st
 
@@ -204,7 +204,7 @@ def _render_log_panel() -> None:
         # Elapsed time
         try:
             started = datetime.fromisoformat(ts.start_time)
-            elapsed = datetime.utcnow() - started
+            elapsed = datetime.now(timezone.utc) - started
             mins, secs = divmod(int(elapsed.total_seconds()), 60)
             st.caption(f"Elapsed: {mins}m {secs}s")
         except Exception:
@@ -285,9 +285,9 @@ def _reload_model_after_training() -> None:
     """
     if not config.BEST_MODEL_PATH.exists():
         return
-    # Force reload by resetting the model key
-    if st.session_state.get(state.KEY_MODEL_LOADED):
-        return   # already loaded, no action needed
+    training_state = st.session_state.get(state.KEY_TRAINING_STATE)
+    if isinstance(training_state, dict) and training_state.get('model_reloaded'):
+        return
     try:
         from modules.dataset.preprocessor import load_class_names
         from modules.detection.inference import load_model
@@ -301,6 +301,7 @@ def _reload_model_after_training() -> None:
         st.session_state[state.KEY_MODEL]         = model
         st.session_state[state.KEY_MODEL_LOADED]  = True
         st.session_state[state.KEY_DEVICE_INFO]   = str(config.DEVICE)
+        _mark_model_reloaded()
         st.success("✅ Model loaded into dashboard automatically.")
     except Exception as e:
         st.warning(f"Training completed but model auto-load failed: {e}. Restart the dashboard.")
@@ -349,7 +350,18 @@ def _parse_best_val_acc(log_lines: list[str]) -> float | None:
 
 
 def _update_training_snapshot(job: TrainingJob) -> None:
-    st.session_state[state.KEY_TRAINING_STATE] = asdict(job.state)
+    snapshot = asdict(job.state)
+    existing = st.session_state.get(state.KEY_TRAINING_STATE)
+    if isinstance(existing, dict) and existing.get('model_reloaded'):
+        snapshot['model_reloaded'] = True
+    st.session_state[state.KEY_TRAINING_STATE] = snapshot
+
+
+def _mark_model_reloaded() -> None:
+    training_state = st.session_state.get(state.KEY_TRAINING_STATE, {})
+    if isinstance(training_state, dict):
+        training_state['model_reloaded'] = True
+        st.session_state[state.KEY_TRAINING_STATE] = training_state
 
 
 # Re-export for state.py helper

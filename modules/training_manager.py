@@ -19,7 +19,7 @@ TrainingJob — manages one training subprocess lifecycle
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from queue import Queue, Empty
 from threading import Thread
@@ -116,7 +116,7 @@ class TrainingJob:
         args_used = {k: v for k, v in args.items() if k != '_script'}
         self.state = TrainingJobState(
             status='running',
-            start_time=datetime.utcnow().isoformat(),
+            start_time=datetime.now(timezone.utc).isoformat(),
             args_used=args_used,
         )
 
@@ -165,7 +165,7 @@ class TrainingJob:
             if rc is not None:
                 # Process has exited
                 self.state.return_code = rc
-                self.state.end_time = datetime.utcnow().isoformat()
+                self.state.end_time = datetime.now(timezone.utc).isoformat()
                 self.state.status = 'completed' if rc == 0 else 'failed'
                 if rc != 0:
                     self.state.error_msg = f"Process exited with code {rc}"
@@ -186,7 +186,7 @@ class TrainingJob:
         except Exception:
             pass
         self.state.status = 'stopped'
-        self.state.end_time = datetime.utcnow().isoformat()
+        self.state.end_time = datetime.now(timezone.utc).isoformat()
 
     def is_running(self) -> bool:
         """True if subprocess exists and has not yet exited."""
