@@ -5,7 +5,7 @@ Tests verify the TrainingJob lifecycle using a real subprocess running
 a simple Python script (not scripts/train.py — no dataset needed).
 
 Run:
-    pytest tests/test_training_manager.py -v
+    python -m pytest tests/test_training_manager.py -v
 """
 import sys
 import time
@@ -74,6 +74,10 @@ class TestTrainingJobState:
     def test_default_args_used_is_empty_dict(self):
         s = TrainingJobState()
         assert s.args_used == {}
+
+    def test_default_model_reloaded_is_false(self):
+        s = TrainingJobState()
+        assert s.model_reloaded is False
 
 
 # ─────────────────────────────────────────────────────────────────────────────

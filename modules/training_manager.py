@@ -33,13 +33,14 @@ class TrainingJobState:
     Serialisable snapshot of a training job — stored in session_state.
     All fields must be JSON-compatible types (no Process objects).
     """
-    status:      str = 'idle'        # 'idle' | 'running' | 'completed' | 'failed' | 'stopped'
-    start_time:  str = ''            # ISO 8601 string
-    end_time:    str = ''            # ISO 8601 string — set on completion
-    return_code: int | None = None
-    log_lines:   list[str] = field(default_factory=list)
-    args_used:   dict = field(default_factory=dict)
-    error_msg:   str = ''
+    status:         str = 'idle'        # 'idle' | 'running' | 'completed' | 'failed' | 'stopped'
+    start_time:     str = ''            # ISO 8601 string
+    end_time:       str = ''            # ISO 8601 string — set on completion
+    return_code:    int | None = None
+    log_lines:      list[str] = field(default_factory=list)
+    args_used:      dict = field(default_factory=dict)
+    error_msg:      str = ''
+    model_reloaded: bool = False
 
 
 class TrainingJob:

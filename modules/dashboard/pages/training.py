@@ -204,6 +204,8 @@ def _render_log_panel() -> None:
         # Elapsed time
         try:
             started = datetime.fromisoformat(ts.start_time)
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
             elapsed = datetime.now(timezone.utc) - started
             mins, secs = divmod(int(elapsed.total_seconds()), 60)
             st.caption(f"Elapsed: {mins}m {secs}s")
@@ -289,8 +291,8 @@ def _reload_model_after_training() -> None:
     """
     if not config.BEST_MODEL_PATH.exists():
         return
-    training_state = st.session_state.get(state.KEY_TRAINING_STATE)
-    if isinstance(training_state, dict) and training_state.get('model_reloaded'):
+    job = st.session_state.get(state.KEY_TRAINING_JOB)
+    if job and job.state.model_reloaded:
         return
     try:
         from modules.dataset.preprocessor import load_class_names
@@ -308,7 +310,10 @@ def _reload_model_after_training() -> None:
         _mark_model_reloaded()
         st.success("✅ Model loaded into dashboard automatically.")
     except Exception as e:
-        st.warning(f"Training completed but model auto-load failed: {e}. Restart the dashboard.")
+        st.warning(
+            f"Training completed but model auto-load failed: {e}. "
+            "You may need to restart the dashboard or manually reload from the Home page."
+        )
 
 
 def _estimate_progress(log_lines: list[str], total_epochs: int) -> float:
@@ -354,18 +359,14 @@ def _parse_best_val_acc(log_lines: list[str]) -> float | None:
 
 
 def _update_training_snapshot(job: TrainingJob) -> None:
-    snapshot = asdict(job.state)
-    existing = st.session_state.get(state.KEY_TRAINING_STATE)
-    if isinstance(existing, dict) and existing.get('model_reloaded'):
-        snapshot['model_reloaded'] = True
-    st.session_state[state.KEY_TRAINING_STATE] = snapshot
+    st.session_state[state.KEY_TRAINING_STATE] = asdict(job.state)
 
 
 def _mark_model_reloaded() -> None:
-    training_state = st.session_state.get(state.KEY_TRAINING_STATE, {})
-    if isinstance(training_state, dict):
-        training_state['model_reloaded'] = True
-        st.session_state[state.KEY_TRAINING_STATE] = training_state
+    job = st.session_state.get(state.KEY_TRAINING_JOB)
+    if job:
+        job.state.model_reloaded = True
+        st.session_state[state.KEY_TRAINING_STATE] = asdict(job.state)
 
 
 # Re-export for state.py helper
