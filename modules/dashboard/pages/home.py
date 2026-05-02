@@ -150,7 +150,7 @@ def _render_module_status() -> None:
             return 'color: #e6a21e; font-weight: bold'
         return 'color: #d23232; font-weight: bold'
 
-    styled = df.style.applymap(_colour_status, subset=['Status'])
+    styled = df.style.map(_colour_status, subset=['Status'])
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
     # Summary counts
