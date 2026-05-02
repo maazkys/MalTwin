@@ -118,6 +118,7 @@ def render_sidebar() -> str:
             "🖼️ Dataset Gallery",
             True,     # always selectable — gallery shows its own info message
         ),
+        ("🏋️ Model Training",  "🏋️ Model Training",   True),
         ("🖥️ Digital Twin",    "🖥️ Digital Twin",     True),
     ]
 
@@ -154,6 +155,9 @@ def render_sidebar() -> str:
     if state.has_detection_result():
         result = st.session_state[state.KEY_DETECTION]
         st.sidebar.success(f"🎯 {result['predicted_family']}")
+
+    if state.is_training_running():
+        st.sidebar.warning("🏋️ Training in progress…")
 
     # ── Module health summary (compact) ──────────────────────────────────────
     st.sidebar.divider()
@@ -197,6 +201,9 @@ def main() -> None:
         render()
     elif page == "🖼️ Dataset Gallery":
         from modules.dashboard.pages.gallery import render
+        render()
+    elif page == "🏋️ Model Training":
+        from modules.dashboard.pages.training import render
         render()
     elif page == "🖥️ Digital Twin":
         from modules.dashboard.pages.digital_twin import render

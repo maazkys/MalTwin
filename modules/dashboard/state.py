@@ -16,6 +16,8 @@ KEY_DETECTION    = 'detection_result'  # dict from predict_single() or None
 KEY_MODEL_LOADED = 'model_loaded'      # bool
 KEY_DEVICE_INFO  = 'device_info'       # str e.g. "cuda:0" or "cpu"
 KEY_APP_START_TIME = 'app_start_time'   # datetime — set once at first run
+KEY_TRAINING_JOB   = 'training_job'     # TrainingJob instance or None
+KEY_TRAINING_STATE = 'training_state'   # TrainingJobState dict snapshot or None
 KEY_HEATMAP      = 'gradcam_heatmap'   # dict from generate_gradcam() or None
 
 
@@ -33,6 +35,8 @@ def init_session_state() -> None:
         KEY_MODEL_LOADED: False,
         KEY_DEVICE_INFO:  'unknown',
         KEY_APP_START_TIME: None,
+        KEY_TRAINING_JOB:   None,
+        KEY_TRAINING_STATE: None,
         KEY_HEATMAP:      None,
     }
     for key, default in defaults.items():
@@ -70,3 +74,18 @@ def is_model_loaded() -> bool:
 
 def has_heatmap() -> bool:
     return st.session_state.get(KEY_HEATMAP) is not None
+
+
+def is_training_running() -> bool:
+    job = st.session_state.get(KEY_TRAINING_JOB)
+    if job is None:
+        return False
+    return job.is_running()
+
+
+def get_training_state():
+    """Returns TrainingJobState or None."""
+    job = st.session_state.get(KEY_TRAINING_JOB)
+    if job is None:
+        return None
+    return job.state
