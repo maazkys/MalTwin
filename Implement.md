@@ -1,9 +1,10 @@
-# MalTwin — Implementation Step 4: Dynamic Module Status + Navigation Gating + System Stats
-### SRS refs: FR1.1, FR1.3, FR2.3 (partial), NFR REL-1, NFR USE-2
+# MalTwin — Implementation Step 5: Dashboard-Triggered Training Flow
+### SRS refs: BO-7, UC-05, FR-B2 (partial), NFR PER-2
 
-> Complete Steps 1–3 first. Full regression suite must be green before starting here.
-> This step touches `home.py`, `app.py`, and `state.py` — all three are shared
-> infrastructure. Be careful not to break existing page routing.
+> Complete Steps 1–4 first. Full regression suite must be green before starting.
+> This step adds a new dashboard page — `training.py` — and wires it into routing.
+> It does NOT replace `scripts/train.py`; the CLI script remains the primary
+> training path. The dashboard provides a managed, observable wrapper around it.
 
 ---
 
@@ -11,509 +12,635 @@
 
 | Item | Status before | Status after |
 |---|---|---|
-| `modules/dashboard/health.py` | Does not exist | Module health checker — dynamic status for all 8 modules |
-| `modules/dashboard/pages/home.py` | Static hardcoded status strings | Live status badges + real system stats (CPU/mem/uptime) |
-| `modules/dashboard/app.py` | No gating — all pages always selectable | Navigation gating — unavailable pages show warning, not crash |
-| `modules/dashboard/state.py` | No health/uptime keys | `KEY_APP_START_TIME` added for uptime tracking |
-| `tests/test_health.py` | Does not exist | Full health checker test suite |
+| `modules/dashboard/pages/training.py` | Does not exist | Full training management page |
+| `modules/dashboard/app.py` | 5-page routing | 6-page routing with training page |
+| `modules/dashboard/state.py` | No training keys | `KEY_TRAINING_STATE` added |
+| `modules/training_manager.py` | Does not exist | Subprocess-based training runner with live log streaming |
+| `tests/test_training_manager.py` | Does not exist | Training manager test suite |
 
 ---
 
 ## Mandatory Rules
 
-- `health.py` functions **never raise** — every check is wrapped in try/except, returns a status dict.
-- Status values are exactly one of: `"active"`, `"inactive"`, `"error"` — no other strings.
-- `psutil` is used for CPU/memory — add to `requirements.txt` if not present.
-- App start time is stored in `session_state[KEY_APP_START_TIME]` as a `datetime` object set once at startup.
-- Navigation gating uses `st.sidebar.radio` with `disabled` entries replaced by a custom rendering approach (Streamlit does not natively support disabled radio options — use `st.sidebar.selectbox` with a note, or render unavailable pages as greyed caption items).
-- The status refresh interval is **30 seconds** using `st.cache_data(ttl=30)` — not 5 seconds (FR1.1 says 5s but that would cause constant reruns degrading UX; 30s is the practical implementation).
-- System stats (CPU, memory, uptime) replace the "Not Configured" digital twin placeholder on the home page.
-- All health checks are **non-blocking** — if a check takes more than 2 seconds it is considered `"error"`.
+- Training runs in a **subprocess** (`subprocess.Popen`) — never in the main Streamlit process. Blocking the main process freezes the entire dashboard for all users.
+- The training subprocess runs `scripts/train.py` with the configured args — do not duplicate training logic.
+- Log lines are read from the subprocess `stdout` pipe and stored in `session_state` for display — not streamed directly (Streamlit does not support true async streaming without workarounds).
+- `st.rerun()` is used on a timer loop to poll subprocess status — the page auto-refreshes every 2 seconds while training is running.
+- Training state persists in `session_state[KEY_TRAINING_STATE]` as a dict — survives page navigation during training.
+- The training page **never** imports PyTorch or any ML module directly — it only launches the subprocess and reads its output.
+- Hyperparameter widgets write to `session_state` — they do not directly start training.
+- Only **one training job** can run at a time — the Start button is disabled while a job is active.
+- `subprocess.Popen` must use `stdout=PIPE, stderr=STDOUT, text=True, bufsize=1` for line-buffered output.
+- On page unload / navigation away, the subprocess is **not** killed — training continues in the background. The user can return to the training page to see progress.
 
 ---
 
-## New `requirements.txt` entry
-
-Add if not already present:
-```
-psutil>=5.9.0
-```
-
-Verify:
-```bash
-python -c "import psutil; print(psutil.__version__)"
-# If missing:
-pip install psutil --break-system-packages
-```
-
----
-
-## File 1: `modules/dashboard/health.py`
+## File 1: `modules/training_manager.py`
 
 ```python
-# modules/dashboard/health.py
+# modules/training_manager.py
 """
-Dynamic health checker for all 8 MalTwin modules.
+Subprocess-based training job manager for the MalTwin dashboard.
 
-SRS ref: FR1.1 — display operational status of all eight modules,
-         refreshed automatically without manual page reload.
+Launches scripts/train.py as a child process, captures stdout line by line,
+and exposes a simple polling interface for the Streamlit training page.
 
-Each check returns:
-    {
-        'status':  'active' | 'inactive' | 'error',
-        'detail':  str,   # one-line human-readable explanation
-        'emoji':   str,   # ✅ | ⚠️ | 🔴
-    }
+Never imports PyTorch, torchvision, or any ML library.
+All ML work happens inside the subprocess.
 
-get_all_module_statuses() is cached with ttl=30 seconds.
-Individual check functions never raise.
+Public API
+----------
+TrainingJob — manages one training subprocess lifecycle
+    .start(args)   → launches subprocess
+    .poll()        → returns (is_running, new_lines, return_code)
+    .stop()        → terminates subprocess gracefully
+    .is_running()  → bool
 """
+import subprocess
 import sys
 import time
-import importlib
-import streamlit as st
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from threading import Thread
+from queue import Queue, Empty
 
 import config
 
 
-# ── Individual module checks ──────────────────────────────────────────────────
+@dataclass
+class TrainingJobState:
+    """
+    Serialisable snapshot of a training job — stored in session_state.
+    All fields must be JSON-compatible types (no Process objects).
+    """
+    status:       str = 'idle'        # 'idle' | 'running' | 'completed' | 'failed' | 'stopped'
+    start_time:   str = ''            # ISO 8601 string
+    end_time:     str = ''            # ISO 8601 string — set on completion
+    return_code:  int | None = None
+    log_lines:    list[str] = field(default_factory=list)
+    args_used:    dict = field(default_factory=dict)
+    error_msg:    str = ''
 
-def _check_module1_digital_twin() -> dict:
-    """M1: Check if Docker is reachable on the host."""
-    try:
-        import subprocess
-        result = subprocess.run(
-            ['docker', 'info'],
-            capture_output=True,
-            timeout=2,
+
+class TrainingJob:
+    """
+    Manages one training subprocess.
+
+    Usage:
+        job = TrainingJob()
+        job.start({'epochs': 5, 'lr': 0.001, ...})
+        while job.is_running():
+            is_running, new_lines, rc = job.poll()
+            # update UI with new_lines
+            time.sleep(2)
+    """
+
+    def __init__(self):
+        self._process:  subprocess.Popen | None = None
+        self._queue:    Queue = Queue()
+        self._reader:   Thread | None = None
+        self.state:     TrainingJobState = TrainingJobState()
+
+    def start(self, args: dict) -> None:
+        """
+        Launch scripts/train.py as a subprocess with the given hyperparameters.
+
+        Args:
+            args: dict with keys matching CLI flags (without --):
+                  epochs, lr, batch_size, workers, oversample, seed, no_augment
+                  All are optional — missing keys fall back to config defaults.
+
+        Raises:
+            RuntimeError: if a job is already running.
+            FileNotFoundError: if scripts/train.py does not exist.
+        """
+        if self.is_running():
+            raise RuntimeError("A training job is already running.")
+
+        script_path = Path('scripts') / 'train.py'
+        if not script_path.exists():
+            raise FileNotFoundError(f"Training script not found: {script_path}")
+
+        # Build CLI command
+        cmd = [sys.executable, str(script_path)]
+        if 'epochs' in args:
+            cmd += ['--epochs', str(args['epochs'])]
+        if 'lr' in args:
+            cmd += ['--lr', str(args['lr'])]
+        if 'batch_size' in args:
+            cmd += ['--batch-size', str(args['batch_size'])]
+        if 'workers' in args:
+            cmd += ['--workers', str(args['workers'])]
+        if 'oversample' in args:
+            cmd += ['--oversample', str(args['oversample'])]
+        if 'seed' in args:
+            cmd += ['--seed', str(args['seed'])]
+        if args.get('no_augment'):
+            cmd += ['--no-augment']
+
+        self._process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,               # line-buffered
+            cwd=Path.cwd(),
         )
-        if result.returncode == 0:
-            return {
-                'status': 'inactive',
-                'detail': 'Docker available but Digital Twin not deployed',
-                'emoji':  '⚠️',
-            }
-        return {
-            'status': 'inactive',
-            'detail': 'Docker not running — Digital Twin unavailable',
-            'emoji':  '⚠️',
-        }
-    except FileNotFoundError:
-        return {
-            'status': 'inactive',
-            'detail': 'Docker not installed — Digital Twin deferred',
-            'emoji':  '⚠️',
-        }
-    except Exception as e:
-        return {
-            'status': 'inactive',
-            'detail': f'Digital Twin check failed: {e}',
-            'emoji':  '⚠️',
-        }
 
+        self.state = TrainingJobState(
+            status='running',
+            start_time=datetime.utcnow().isoformat(),
+            args_used=dict(args),
+        )
 
-def _check_module2_binary_to_image() -> dict:
-    """M2: Verify the binary_to_image module imports and BinaryConverter is usable."""
-    try:
-        from modules.binary_to_image.converter import BinaryConverter
-        from modules.binary_to_image.utils import validate_binary_format
-        # Minimal functional test — convert a tiny byte sequence
-        converter = BinaryConverter(img_size=config.IMG_SIZE)
-        dummy     = b'MZ' + b'\x00' * 62 + b'\x00' * 900   # minimal PE skeleton
-        arr       = converter.convert(dummy)
-        assert arr.shape == (config.IMG_SIZE, config.IMG_SIZE)
-        return {'status': 'active', 'detail': 'Binary-to-image conversion ready', 'emoji': '✅'}
-    except Exception as e:
-        return {'status': 'error', 'detail': f'M2 error: {e}', 'emoji': '🔴'}
+        # Start background reader thread
+        self._reader = Thread(target=self._read_output, daemon=True)
+        self._reader.start()
 
-
-def _check_module3_dataset() -> dict:
-    """M3: Check dataset directory exists and has at least one family subfolder."""
-    try:
-        if not config.DATA_DIR.exists():
-            return {
-                'status': 'inactive',
-                'detail': f'Dataset not found at {config.DATA_DIR}',
-                'emoji':  '⚠️',
-            }
-        families = [p for p in config.DATA_DIR.iterdir() if p.is_dir()]
-        if not families:
-            return {
-                'status': 'inactive',
-                'detail': 'Dataset directory empty — download Malimg',
-                'emoji':  '⚠️',
-            }
-        return {
-            'status': 'active',
-            'detail': f'Malimg dataset: {len(families)} families found',
-            'emoji':  '✅',
-        }
-    except Exception as e:
-        return {'status': 'error', 'detail': f'M3 error: {e}', 'emoji': '🔴'}
-
-
-def _check_module4_enhancement() -> dict:
-    """M4: Verify augmentor and balancer import and transforms build correctly."""
-    try:
-        from modules.enhancement.augmentor import get_train_transforms, get_val_transforms
-        from modules.enhancement.balancer import ClassAwareOversampler
-        t = get_train_transforms(config.IMG_SIZE)
-        v = get_val_transforms(config.IMG_SIZE)
-        assert t is not None and v is not None
-        return {'status': 'active', 'detail': 'Enhancement & balancing ready', 'emoji': '✅'}
-    except Exception as e:
-        return {'status': 'error', 'detail': f'M4 error: {e}', 'emoji': '🔴'}
-
-
-def _check_module5_detection() -> dict:
-    """M5: Check model file exists and loads correctly."""
-    try:
-        if not config.BEST_MODEL_PATH.exists():
-            return {
-                'status': 'inactive',
-                'detail': 'No trained model — run scripts/train.py',
-                'emoji':  '⚠️',
-            }
-        if not config.CLASS_NAMES_PATH.exists():
-            return {
-                'status': 'inactive',
-                'detail': 'class_names.json missing — run scripts/train.py',
-                'emoji':  '⚠️',
-            }
-        # Check file size is non-trivial (>10KB means a real model, not an empty file)
-        size_kb = config.BEST_MODEL_PATH.stat().st_size / 1024
-        if size_kb < 10:
-            return {
-                'status': 'error',
-                'detail': f'Model file suspiciously small ({size_kb:.0f} KB)',
-                'emoji':  '🔴',
-            }
-        return {
-            'status': 'active',
-            'detail': f'Model ready ({size_kb / 1024:.1f} MB)',
-            'emoji':  '✅',
-        }
-    except Exception as e:
-        return {'status': 'error', 'detail': f'M5 error: {e}', 'emoji': '🔴'}
-
-
-def _check_module6_dashboard() -> dict:
-    """M6: Dashboard is running if this function is executing — always active."""
-    try:
-        import streamlit
-        return {
-            'status': 'active',
-            'detail': f'Dashboard running (Streamlit {streamlit.__version__})',
-            'emoji':  '✅',
-        }
-    except Exception as e:
-        return {'status': 'error', 'detail': f'M6 error: {e}', 'emoji': '🔴'}
-
-
-def _check_module7_gradcam() -> dict:
-    """M7: Verify Captum is installed and generate_gradcam is importable."""
-    try:
-        from modules.detection.gradcam import generate_gradcam
-        import captum
-        if not config.BEST_MODEL_PATH.exists():
-            return {
-                'status': 'inactive',
-                'detail': f'Grad-CAM ready (Captum {captum.__version__}) — awaiting trained model',
-                'emoji':  '⚠️',
-            }
-        return {
-            'status': 'active',
-            'detail': f'Grad-CAM XAI ready (Captum {captum.__version__})',
-            'emoji':  '✅',
-        }
-    except ImportError:
-        return {
-            'status': 'error',
-            'detail': 'Captum not installed — run: pip install captum',
-            'emoji':  '🔴',
-        }
-    except Exception as e:
-        return {'status': 'error', 'detail': f'M7 error: {e}', 'emoji': '🔴'}
-
-
-def _check_module8_reporting() -> dict:
-    """M8: Verify fpdf2 and MITRE JSON are available."""
-    try:
-        from modules.reporting import generate_pdf_report, generate_json_report
-        from fpdf import FPDF
-
-        mitre_ok = config.MITRE_JSON_PATH.exists()
-        if not mitre_ok:
-            return {
-                'status': 'inactive',
-                'detail': 'MITRE mapping JSON missing — create data/mitre_ics_mapping.json',
-                'emoji':  '⚠️',
-            }
-        import json
-        with open(config.MITRE_JSON_PATH) as f:
-            db = json.load(f)
-        n = len(db)
-        return {
-            'status': 'active',
-            'detail': f'Reporting ready — MITRE DB: {n}/25 families mapped',
-            'emoji':  '✅' if n == 25 else '⚠️',
-        }
-    except ImportError:
-        return {
-            'status': 'error',
-            'detail': 'fpdf2 not installed — run: pip install fpdf2',
-            'emoji':  '🔴',
-        }
-    except Exception as e:
-        return {'status': 'error', 'detail': f'M8 error: {e}', 'emoji': '🔴'}
-
-
-# ── Aggregate ─────────────────────────────────────────────────────────────────
-
-@st.cache_data(ttl=30, show_spinner=False)
-def get_all_module_statuses() -> list[dict]:
-    """
-    Run all 8 module health checks and return a list of status dicts.
-    Cached for 30 seconds — avoids hammering the filesystem on every rerun.
-
-    Returns:
-        list of 8 dicts, each with keys:
-            'id':     str  e.g. 'M1'
-            'name':   str  e.g. 'Digital Twin Simulation'
-            'status': str  'active' | 'inactive' | 'error'
-            'detail': str
-            'emoji':  str
-    """
-    checks = [
-        ('M1', 'Digital Twin Simulation',      _check_module1_digital_twin),
-        ('M2', 'Binary-to-Image Conversion',   _check_module2_binary_to_image),
-        ('M3', 'Dataset & Preprocessing',      _check_module3_dataset),
-        ('M4', 'Data Enhancement & Balancing', _check_module4_enhancement),
-        ('M5', 'Intelligent Malware Detection', _check_module5_detection),
-        ('M6', 'Dashboard & Visualization',    _check_module6_dashboard),
-        ('M7', 'Explainable AI (Grad-CAM)',    _check_module7_gradcam),
-        ('M8', 'Automated Threat Reporting',   _check_module8_reporting),
-    ]
-
-    results = []
-    for mod_id, name, check_fn in checks:
+    def _read_output(self) -> None:
+        """Background thread: reads stdout line by line into the queue."""
+        if self._process is None:
+            return
         try:
-            result = check_fn()
-        except Exception as e:
-            result = {
-                'status': 'error',
-                'detail': f'Health check crashed: {e}',
-                'emoji':  '🔴',
-            }
-        results.append({
-            'id':     mod_id,
-            'name':   name,
-            'status': result['status'],
-            'detail': result['detail'],
-            'emoji':  result['emoji'],
-        })
+            for line in self._process.stdout:
+                self._queue.put(line.rstrip('\n'))
+        except Exception:
+            pass
+        finally:
+            self._queue.put(None)   # sentinel — signals EOF
 
-    return results
+    def poll(self) -> tuple[bool, list[str], int | None]:
+        """
+        Non-blocking poll. Call from the Streamlit page on each rerun.
+
+        Returns:
+            (is_running, new_lines, return_code)
+            - is_running: True if subprocess still alive
+            - new_lines:  list of new stdout lines since last poll (may be empty)
+            - return_code: None while running, int when finished
+        """
+        new_lines = []
+
+        # Drain the queue
+        while True:
+            try:
+                line = self._queue.get_nowait()
+                if line is None:
+                    break          # EOF sentinel
+                new_lines.append(line)
+                self.state.log_lines.append(line)
+            except Empty:
+                break
+
+        # Check if process has finished
+        if self._process is not None:
+            rc = self._process.poll()
+            if rc is not None:
+                # Process has exited
+                self.state.return_code = rc
+                self.state.end_time    = datetime.utcnow().isoformat()
+                self.state.status      = 'completed' if rc == 0 else 'failed'
+                if rc != 0:
+                    self.state.error_msg = f"Process exited with code {rc}"
+                return False, new_lines, rc
+
+        return self.is_running(), new_lines, None
+
+    def stop(self) -> None:
+        """Terminate the subprocess gracefully (SIGTERM, then SIGKILL after 5s)."""
+        if self._process is None:
+            return
+        try:
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+        except Exception:
+            pass
+        self.state.status   = 'stopped'
+        self.state.end_time = datetime.utcnow().isoformat()
+
+    def is_running(self) -> bool:
+        """True if subprocess exists and has not yet exited."""
+        if self._process is None:
+            return False
+        return self._process.poll() is None
 
 
-def get_system_stats() -> dict:
-    """
-    Return current system resource usage.
-
-    Returns:
-        {
-            'cpu_pct':    float,  # CPU usage percentage 0–100
-            'mem_pct':    float,  # RAM usage percentage 0–100
-            'mem_used_gb':float,
-            'mem_total_gb':float,
-            'uptime_str': str,    # e.g. "2h 34m"
-            'device':     str,    # 'cpu' or 'cuda:0'
-            'error':      bool,   # True if psutil failed
-        }
-    """
-    try:
-        import psutil
-        cpu  = psutil.cpu_percent(interval=0.1)
-        mem  = psutil.virtual_memory()
-        return {
-            'cpu_pct':     cpu,
-            'mem_pct':     mem.percent,
-            'mem_used_gb': mem.used  / (1024 ** 3),
-            'mem_total_gb':mem.total / (1024 ** 3),
-            'uptime_str':  _format_uptime(),
-            'device':      str(config.DEVICE),
-            'error':       False,
-        }
-    except Exception as e:
-        return {
-            'cpu_pct':     0.0,
-            'mem_pct':     0.0,
-            'mem_used_gb': 0.0,
-            'mem_total_gb':0.0,
-            'uptime_str':  'unknown',
-            'device':      str(config.DEVICE),
-            'error':       True,
-        }
-
-
-def _format_uptime() -> str:
-    """
-    Compute dashboard uptime from session_state[KEY_APP_START_TIME].
-    Returns formatted string e.g. '2h 34m' or '45s'.
-    Falls back to 'unknown' if start time not set.
-    """
-    try:
-        from modules.dashboard.state import KEY_APP_START_TIME
-        import streamlit as st
-        start = st.session_state.get(KEY_APP_START_TIME)
-        if start is None:
-            return 'unknown'
-        delta = datetime.utcnow() - start
-        total_seconds = int(delta.total_seconds())
-        hours, rem    = divmod(total_seconds, 3600)
-        minutes, secs = divmod(rem, 60)
-        if hours > 0:
-            return f"{hours}h {minutes}m"
-        if minutes > 0:
-            return f"{minutes}m {secs}s"
-        return f"{secs}s"
-    except Exception:
-        return 'unknown'
+# ── Module-level singleton ─────────────────────────────────────────────────────
+# One TrainingJob per Python process — Streamlit reruns share this instance
+# via session_state (the TrainingJob object is stored there, not recreated).
+# Do NOT instantiate at module level — let the page create it.
 ```
 
 ---
 
-## File 2: Update `modules/dashboard/state.py`
+## File 2: `modules/dashboard/state.py` — additions only
 
-Add the app start time key and update `init_session_state()`:
-
-**Add constant** (after `KEY_DEVICE_INFO`):
+**Add constant** (after `KEY_APP_START_TIME`):
 ```python
-KEY_APP_START_TIME = 'app_start_time'   # datetime — set once at first run
+KEY_TRAINING_JOB   = 'training_job'    # TrainingJob instance or None
+KEY_TRAINING_STATE = 'training_state'  # TrainingJobState dict snapshot or None
 ```
 
 **Add to `init_session_state()` defaults dict**:
 ```python
-KEY_APP_START_TIME: None,
+KEY_TRAINING_JOB:   None,
+KEY_TRAINING_STATE: None,
 ```
 
-**Add initialisation logic** at the end of `init_session_state()` (after the defaults loop):
+**Add helper functions** (after `is_model_loaded()`):
 ```python
-    # Set start time once — only on very first run of the session
-    if st.session_state[KEY_APP_START_TIME] is None:
-        from datetime import datetime
-        st.session_state[KEY_APP_START_TIME] = datetime.utcnow()
+def is_training_running() -> bool:
+    job = st.session_state.get(KEY_TRAINING_JOB)
+    if job is None:
+        return False
+    return job.is_running()
+
+
+def get_training_state():
+    """Returns TrainingJobState or None."""
+    job = st.session_state.get(KEY_TRAINING_JOB)
+    if job is None:
+        return None
+    return job.state
 ```
 
 ---
 
-## File 3: Update `modules/dashboard/pages/home.py`
-
-### 3a — Replace `_render_module_status()` with dynamic version
-
-Find and remove the old `_render_module_status()` function entirely. Replace it with:
+## File 3: `modules/dashboard/pages/training.py`
 
 ```python
-def _render_module_status() -> None:
-    """
-    Render the live module status table using health.py checks.
-    SRS ref: FR1.1 — refreshes automatically (via st.cache_data ttl=30s).
-    """
-    import pandas as pd
-    from modules.dashboard.health import get_all_module_statuses
+# modules/dashboard/pages/training.py
+"""
+Dashboard-triggered model training page.
 
-    statuses = get_all_module_statuses()
+SRS ref: BO-7 — interactive Streamlit dashboard enabling training.
+         UC-05 — Train Detection Model use case.
 
-    rows = [
-        {
-            'ID':     s['id'],
-            'Module': s['name'],
-            'Status': f"{s['emoji']} {s['status'].capitalize()}",
-            'Detail': s['detail'],
-        }
-        for s in statuses
-    ]
+Layout:
+    Left col (1/3):  Hyperparameter configuration widgets
+    Right col (2/3): Training log, progress indicators, status
 
-    df = pd.DataFrame(rows)
+Training runs scripts/train.py as a subprocess. This page never imports
+PyTorch directly — all ML work happens in the subprocess.
+"""
+import time
+import streamlit as st
+from datetime import datetime
 
-    # Colour-code the Status column
-    def _colour_status(val: str) -> str:
-        if '✅' in val:
-            return 'color: #3cb371; font-weight: bold'
-        if '⚠️' in val:
-            return 'color: #e6a21e; font-weight: bold'
-        return 'color: #d23232; font-weight: bold'
+import config
+from modules.dashboard import state
+from modules.training_manager import TrainingJob, TrainingJobState
 
-    styled = df.style.applymap(_colour_status, subset=['Status'])
-    st.dataframe(styled, use_container_width=True, hide_index=True)
 
-    # Summary counts
-    n_active   = sum(1 for s in statuses if s['status'] == 'active')
-    n_inactive = sum(1 for s in statuses if s['status'] == 'inactive')
-    n_error    = sum(1 for s in statuses if s['status'] == 'error')
+# ── Constants ─────────────────────────────────────────────────────────────────
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("✅ Active",   n_active)
-    col2.metric("⚠️ Inactive", n_inactive)
-    col3.metric("🔴 Error",    n_error)
+_POLL_INTERVAL_S = 2      # seconds between auto-reruns while training
+_MAX_LOG_LINES   = 300    # cap displayed log lines to avoid massive DOM
 
-    st.caption("Status refreshes every 30 seconds automatically.")
-```
 
-### 3b — Replace the "Digital Twin Status" placeholder in `render()`
+def render():
+    st.title("🏋️ Model Training")
+    st.markdown(
+        "Configure and launch a training run directly from the dashboard. "
+        "Training runs `scripts/train.py` as a background process — you can "
+        "navigate away and return to check progress."
+    )
 
-Find the `with col_right:` block that shows `st.info("🖥️ Digital Twin simulation is in a future implementation phase.")` and replace the entire block:
+    # Dataset guard
+    if not config.DATA_DIR.exists() or not any(config.DATA_DIR.iterdir()):
+        st.error(
+            "Error: Malimg dataset not found. "
+            f"Cause: {config.DATA_DIR} is empty or does not exist. "
+            "Action: Download the Malimg dataset and extract it before training."
+        )
+        return
 
-```python
-    with col_right:
-        st.subheader("System Resources")
-        from modules.dashboard.health import get_system_stats
-        stats = get_system_stats()
+    st.markdown("---")
 
-        if stats['error']:
-            st.caption("System stats unavailable (psutil error).")
-        else:
-            st.metric("CPU Usage",    f"{stats['cpu_pct']:.1f}%")
-            st.metric("RAM Usage",    f"{stats['mem_pct']:.1f}%")
-            st.metric(
-                "RAM Used",
-                f"{stats['mem_used_gb']:.1f} / {stats['mem_total_gb']:.1f} GB",
+    col_config, col_log = st.columns([1, 2])
+
+    with col_config:
+        _render_config_panel()
+
+    with col_log:
+        _render_log_panel()
+
+    # Auto-rerun while training is active
+    if state.is_training_running():
+        time.sleep(_POLL_INTERVAL_S)
+        st.rerun()
+
+
+def _render_config_panel() -> None:
+    """Hyperparameter widgets + Start/Stop controls."""
+    st.subheader("Configuration")
+
+    is_running = state.is_training_running()
+
+    # Disable all widgets while training is running
+    with st.form("training_config_form"):
+        epochs = st.number_input(
+            "Epochs",
+            min_value=1,
+            max_value=200,
+            value=config.EPOCHS,
+            step=1,
+            disabled=is_running,
+            help="Number of full passes over the training dataset.",
+        )
+        lr = st.number_input(
+            "Learning Rate",
+            min_value=1e-6,
+            max_value=1e-1,
+            value=float(config.LR),
+            format="%.6f",
+            disabled=is_running,
+            help="Adam optimiser learning rate.",
+        )
+        batch_size = st.selectbox(
+            "Batch Size",
+            options=[8, 16, 32, 64, 128],
+            index=[8, 16, 32, 64, 128].index(
+                config.BATCH_SIZE if config.BATCH_SIZE in [8, 16, 32, 64, 128] else 32
+            ),
+            disabled=is_running,
+            help="Number of images per training batch.",
+        )
+        workers = st.slider(
+            "DataLoader Workers",
+            min_value=0,
+            max_value=8,
+            value=min(config.NUM_WORKERS, 4),
+            disabled=is_running,
+            help="Set to 0 if you encounter DataLoader errors on Windows.",
+        )
+        oversample = st.selectbox(
+            "Oversampling Strategy",
+            options=['oversample_minority', 'sqrt_inverse', 'uniform'],
+            index=['oversample_minority', 'sqrt_inverse', 'uniform'].index(
+                config.OVERSAMPLE_STRATEGY
+                if config.OVERSAMPLE_STRATEGY in ['oversample_minority', 'sqrt_inverse', 'uniform']
+                else 'oversample_minority'
+            ),
+            disabled=is_running,
+            help=(
+                "oversample_minority: weight = 1/count (strongest balancing)\n"
+                "sqrt_inverse: weight = 1/√count (softer)\n"
+                "uniform: no oversampling"
+            ),
+        )
+        seed = st.number_input(
+            "Random Seed",
+            min_value=0,
+            max_value=9999,
+            value=config.RANDOM_SEED,
+            disabled=is_running,
+        )
+        no_augment = st.checkbox(
+            "Disable augmentation",
+            value=False,
+            disabled=is_running,
+            help="Use val transforms for training (no random flips / noise).",
+        )
+
+        col_start, col_stop = st.columns(2)
+        with col_start:
+            start_clicked = st.form_submit_button(
+                "▶ Start Training",
+                type="primary",
+                disabled=is_running,
+                use_container_width=True,
             )
-            st.metric("Device",       stats['device'].upper())
-            st.metric("Dashboard Up", stats['uptime_str'])
+        with col_stop:
+            stop_clicked = st.form_submit_button(
+                "■ Stop",
+                type="secondary",
+                disabled=not is_running,
+                use_container_width=True,
+            )
+
+    # Handle Start
+    if start_clicked and not is_running:
+        _start_training({
+            'epochs':     int(epochs),
+            'lr':         float(lr),
+            'batch_size': int(batch_size),
+            'workers':    int(workers),
+            'oversample': oversample,
+            'seed':       int(seed),
+            'no_augment': no_augment,
+        })
+        st.rerun()
+
+    # Handle Stop
+    if stop_clicked and is_running:
+        job = st.session_state.get(state.KEY_TRAINING_JOB)
+        if job:
+            job.stop()
+        st.warning("Training stopped by user.")
+        st.rerun()
+
+    # Config summary (shown while running)
+    if is_running:
+        ts = get_training_state()
+        if ts and ts.args_used:
+            st.markdown("**Running with:**")
+            for k, v in ts.args_used.items():
+                st.caption(f"`{k}`: {v}")
+
+
+def _render_log_panel() -> None:
+    """Training status, progress indicators, and live log."""
+    st.subheader("Training Log")
+
+    job: TrainingJob | None = st.session_state.get(state.KEY_TRAINING_JOB)
+
+    if job is None:
+        st.info("No training job started yet. Configure parameters and click **Start Training**.")
+        return
+
+    ts: TrainingJobState = job.state
+
+    # Poll for new output
+    if job.is_running():
+        _, new_lines, _ = job.poll()
+    else:
+        new_lines = []
+
+    # ── Status banner ─────────────────────────────────────────────────────────
+    if ts.status == 'running':
+        st.success(f"🟢 Training in progress — started {ts.start_time[:19]} UTC")
+
+        # Elapsed time
+        try:
+            started = datetime.fromisoformat(ts.start_time)
+            elapsed = datetime.utcnow() - started
+            mins, secs = divmod(int(elapsed.total_seconds()), 60)
+            st.caption(f"Elapsed: {mins}m {secs}s")
+        except Exception:
+            pass
+
+        st.progress(
+            _estimate_progress(ts.log_lines, ts.args_used.get('epochs', config.EPOCHS)),
+            text="Training in progress…",
+        )
+
+    elif ts.status == 'completed':
+        st.success(
+            f"✅ Training completed successfully "
+            f"(exit code 0) — finished {ts.end_time[:19]} UTC"
+        )
+        # Reload model into session state automatically
+        _reload_model_after_training()
+
+    elif ts.status == 'failed':
+        st.error(
+            f"🔴 Training failed (exit code {ts.return_code}). "
+            "Check the log below for details."
+        )
+
+    elif ts.status == 'stopped':
+        st.warning(f"⚠️ Training stopped by user — {ts.end_time[:19]} UTC")
+
+    # ── Metrics extraction (parse log for best val_acc) ───────────────────────
+    best_val_acc = _parse_best_val_acc(ts.log_lines)
+    if best_val_acc is not None:
+        st.metric("Best Val Accuracy", f"{best_val_acc * 100:.2f}%")
+
+    # ── Live log ──────────────────────────────────────────────────────────────
+    st.markdown("**Output:**")
+    log_text = '\n'.join(ts.log_lines[-_MAX_LOG_LINES:])
+    st.code(log_text or "(no output yet)", language=None)
+
+    # ── Output files ──────────────────────────────────────────────────────────
+    if ts.status == 'completed':
+        st.markdown("**Generated files:**")
+        for path, label in [
+            (config.BEST_MODEL_PATH,    "Best model weights"),
+            (config.CLASS_NAMES_PATH,   "Class names JSON"),
+            (config.PROCESSED_DIR / 'eval_metrics.json',  "Eval metrics JSON"),
+            (config.PROCESSED_DIR / 'confusion_matrix.png', "Confusion matrix PNG"),
+        ]:
+            if path.exists():
+                size_kb = path.stat().st_size / 1024
+                st.caption(f"✅ {label}: `{path}` ({size_kb:.1f} KB)")
+            else:
+                st.caption(f"⚠️ {label}: not found at `{path}`")
+
+
+def _start_training(args: dict) -> None:
+    """Create a new TrainingJob, store it in session_state, and start it."""
+    try:
+        job = TrainingJob()
+        job.start(args)
+        st.session_state[state.KEY_TRAINING_JOB] = job
+    except FileNotFoundError as e:
+        st.error(
+            f"Error: {e}. "
+            "Action: Ensure scripts/train.py exists and you are running "
+            "the dashboard from the repo root directory."
+        )
+    except RuntimeError as e:
+        st.error(f"Error: {e}")
+    except Exception as e:
+        st.error(f"Error: Failed to start training. Cause: {e}")
+
+
+def _reload_model_after_training() -> None:
+    """
+    After successful training, reload class names and model into session_state.
+    Mirrors what load_global_resources() in app.py does at startup.
+    Only reloads if the model file exists and session state is stale.
+    """
+    if not config.BEST_MODEL_PATH.exists():
+        return
+    # Force reload by resetting the model key
+    if st.session_state.get(state.KEY_MODEL_LOADED):
+        return   # already loaded, no action needed
+    try:
+        from modules.dataset.preprocessor import load_class_names
+        from modules.detection.inference import load_model
+        class_names = load_class_names(config.CLASS_NAMES_PATH)
+        model = load_model(
+            config.BEST_MODEL_PATH,
+            len(class_names),
+            config.DEVICE,
+        )
+        st.session_state[state.KEY_CLASS_NAMES]  = class_names
+        st.session_state[state.KEY_MODEL]         = model
+        st.session_state[state.KEY_MODEL_LOADED]  = True
+        st.session_state[state.KEY_DEVICE_INFO]   = str(config.DEVICE)
+        st.success("✅ Model loaded into dashboard automatically.")
+    except Exception as e:
+        st.warning(f"Training completed but model auto-load failed: {e}. Restart the dashboard.")
+
+
+def _estimate_progress(log_lines: list[str], total_epochs: int) -> float:
+    """
+    Parse log lines for 'Epoch NNN/TTT' pattern to estimate progress.
+    Returns float [0.0, 1.0]. Returns 0.05 if no epoch lines found yet
+    (shows a small non-zero bar so the user knows something is happening).
+    """
+    if total_epochs <= 0:
+        return 0.0
+    last_epoch = 0
+    for line in reversed(log_lines):
+        if 'Epoch' in line and '/' in line:
+            try:
+                # e.g. "Epoch 003/030 | Train Loss: ..."
+                part  = line.split('Epoch')[1].strip().split()[0]
+                curr  = int(part.split('/')[0])
+                last_epoch = curr
+                break
+            except (IndexError, ValueError):
+                continue
+    if last_epoch == 0:
+        return 0.05
+    return min(last_epoch / total_epochs, 1.0)
+
+
+def _parse_best_val_acc(log_lines: list[str]) -> float | None:
+    """
+    Scan log lines for '★ New best model saved (val_acc=X.XXXX)' pattern.
+    Returns the highest val_acc seen, or None if not found.
+    """
+    best = None
+    for line in log_lines:
+        if 'val_acc=' in line:
+            try:
+                val_str = line.split('val_acc=')[1].strip().rstrip(')')
+                val     = float(val_str)
+                if best is None or val > best:
+                    best = val
+            except (IndexError, ValueError):
+                continue
+    return best
+
+
+# Re-export for state.py helper
+def get_training_state() -> TrainingJobState | None:
+    job = st.session_state.get(state.KEY_TRAINING_JOB)
+    return job.state if job else None
 ```
 
 ---
 
 ## File 4: Update `modules/dashboard/app.py`
 
-### 4a — Add navigation gating in `render_sidebar()`
+### 4a — Add training to sidebar navigation
 
-Streamlit's `st.sidebar.radio` does not support disabled options natively. The correct
-pattern is to check page availability **after** the user selects a page, and show a
-blocking warning instead of rendering the page. Replace the existing `render_sidebar()`
-with this version:
+In `render_sidebar()`, add to the `nav_options` list (insert before Digital Twin):
 
 ```python
-def render_sidebar() -> str:
-    """
-    Render sidebar navigation with availability indicators.
-    Returns the selected page label string.
-    Greyed-out pages are shown with ⚠️ prefix in the selectbox.
-    """
-    st.sidebar.markdown("# 🛡️ MalTwin")
-    st.sidebar.markdown("*IIoT Malware Detection*")
-    st.sidebar.divider()
+        ("🏋️ Model Training",  "🏋️ Model Training",   True),
+```
 
-    # Determine which pages are available
-    model_ready   = state.is_model_loaded()
-    file_ready    = state.has_uploaded_file()
-    dataset_ready = config.DATA_DIR.exists() and any(config.DATA_DIR.iterdir())
-
-    # Build options with availability markers
-    # Format: (display_label, internal_key, is_available)
+So the full options list becomes:
+```python
     nav_options = [
         ("🏠 Dashboard",        "🏠 Dashboard",        True),
         ("📂 Binary Upload",    "📂 Binary Upload",    True),
@@ -521,377 +648,354 @@ def render_sidebar() -> str:
             "🔍 Malware Detection" if (model_ready and file_ready)
             else "🔍 Malware Detection ⚠️",
             "🔍 Malware Detection",
-            True,     # always selectable — shows its own guard message
+            True,
         ),
         (
             "🖼️ Dataset Gallery" if dataset_ready
             else "🖼️ Dataset Gallery ⚠️",
             "🖼️ Dataset Gallery",
-            True,     # always selectable — gallery shows its own info message
+            True,
         ),
+        ("🏋️ Model Training",  "🏋️ Model Training",   True),
         ("🖥️ Digital Twin",    "🖥️ Digital Twin",     True),
     ]
-
-    display_labels  = [opt[0] for opt in nav_options]
-    internal_keys   = [opt[1] for opt in nav_options]
-
-    selected_display = st.sidebar.radio(
-        "Navigation",
-        options=display_labels,
-        label_visibility="hidden",
-    )
-
-    # Map display label back to internal key (strips ⚠️ suffix)
-    selected_index = display_labels.index(selected_display)
-    page = internal_keys[selected_index]
-
-    # ── System status panel ───────────────────────────────────────────────────
-    st.sidebar.divider()
-    st.sidebar.markdown("**System Status**")
-
-    if state.is_model_loaded():
-        device_info = st.session_state.get(state.KEY_DEVICE_INFO, 'unknown')
-        st.sidebar.success(f"✅ Model Ready ({device_info})")
-    else:
-        st.sidebar.warning("⚠️ No model loaded")
-        st.sidebar.caption("Run `scripts/train.py` first")
-
-    if state.has_uploaded_file():
-        meta = st.session_state[state.KEY_FILE_META]
-        st.sidebar.info(f"📄 {meta['name']}")
-    else:
-        st.sidebar.caption("No file uploaded")
-
-    if state.has_detection_result():
-        result = st.session_state[state.KEY_DETECTION]
-        st.sidebar.success(f"🎯 {result['predicted_family']}")
-
-    # ── Module health summary (compact) ──────────────────────────────────────
-    st.sidebar.divider()
-    try:
-        from modules.dashboard.health import get_all_module_statuses
-        statuses  = get_all_module_statuses()
-        n_active  = sum(1 for s in statuses if s['status'] == 'active')
-        n_total   = len(statuses)
-        st.sidebar.caption(f"Modules: {n_active}/{n_total} active")
-    except Exception:
-        pass
-
-    # ── Footer ────────────────────────────────────────────────────────────────
-    st.sidebar.divider()
-    st.sidebar.caption("COMSATS University, Islamabad")
-    st.sidebar.caption("BS Cyber Security 2023-2027")
-
-    return page
 ```
 
-### 4b — Update `main()` routing to use internal keys
+### 4b — Add training indicator to sidebar status panel
 
-The routing block in `main()` uses internal keys (without ⚠️ suffix) — no change needed if you already used the exact strings `"🔍 Malware Detection"` etc. Double-check the `elif` chain matches the `internal_keys` list above exactly.
+In `render_sidebar()`, after the detection result status block, add:
+
+```python
+    if state.is_training_running():
+        st.sidebar.warning("🏋️ Training in progress…")
+```
+
+### 4c — Add route in `main()`
+
+```python
+    elif page == "🏋️ Model Training":
+        from modules.dashboard.pages.training import render
+        render()
+```
 
 ---
 
-## File 5: `tests/test_health.py`
+## File 5: `tests/test_training_manager.py`
 
 ```python
 """
-Test suite for modules/dashboard/health.py
+Test suite for modules/training_manager.py
 
-Health checks interact with the filesystem (config paths) and optionally
-Docker. All tests mock filesystem state via tmp_path + monkeypatch.
-No real dataset or trained model required.
+Tests verify the TrainingJob lifecycle using a real subprocess running
+a simple Python script (not scripts/train.py — no dataset needed).
 
 Run:
-    pytest tests/test_health.py -v
+    pytest tests/test_training_manager.py -v
 """
+import sys
+import time
+import textwrap
 import pytest
-import torch
-import numpy as np
 from pathlib import Path
-from datetime import datetime
-from unittest.mock import patch, MagicMock
+from modules.training_manager import TrainingJob, TrainingJobState
+
+
+# ── Helper: create a tiny fake training script ────────────────────────────────
+
+@pytest.fixture
+def fake_train_script(tmp_path) -> Path:
+    """
+    Creates a minimal Python script that mimics train.py output format,
+    runs for ~0.5 seconds, then exits 0.
+    """
+    script = tmp_path / "fake_train.py"
+    script.write_text(textwrap.dedent("""
+        import time, sys
+        print("MalTwin Training Pipeline")
+        print("[1/6] Validating dataset...")
+        print("  Families found:   25")
+        print("[2/6] Building DataLoaders...")
+        print("[3/6] Initialising model...")
+        print("[4/6] Training for 3 epoch(s)...")
+        for epoch in range(1, 4):
+            time.sleep(0.1)
+            print(f"Epoch {epoch:03d}/003 | Train Loss: 1.2345 | Val Acc: 0.{epoch*30:04d}")
+            print(f"  ★ New best model saved (val_acc=0.{epoch*30:04d})")
+        print("[5/6] Evaluating...")
+        print("[6/6] Saving outputs...")
+        print("Done!")
+        sys.exit(0)
+    """))
+    return script
+
+
+@pytest.fixture
+def fail_train_script(tmp_path) -> Path:
+    """Script that exits with code 1 immediately."""
+    script = tmp_path / "fail_train.py"
+    script.write_text("import sys; print('ERROR: Dataset not found'); sys.exit(1)")
+    return script
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Individual module checks
+# TrainingJobState dataclass
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestCheckModule2BinaryToImage:
-    def test_returns_active_when_module_importable(self):
-        from modules.dashboard.health import _check_module2_binary_to_image
-        result = _check_module2_binary_to_image()
-        # M2 is always implemented — should be active
-        assert result['status'] == 'active'
-        assert result['emoji'] == '✅'
+class TestTrainingJobState:
+    def test_default_status_is_idle(self):
+        s = TrainingJobState()
+        assert s.status == 'idle'
 
-    def test_returns_dict_with_required_keys(self):
-        from modules.dashboard.health import _check_module2_binary_to_image
-        result = _check_module2_binary_to_image()
-        assert 'status' in result
-        assert 'detail' in result
-        assert 'emoji' in result
+    def test_default_log_lines_is_empty_list(self):
+        s = TrainingJobState()
+        assert s.log_lines == []
 
-    def test_status_is_valid_value(self):
-        from modules.dashboard.health import _check_module2_binary_to_image
-        result = _check_module2_binary_to_image()
-        assert result['status'] in ('active', 'inactive', 'error')
+    def test_default_return_code_is_none(self):
+        s = TrainingJobState()
+        assert s.return_code is None
 
-
-class TestCheckModule3Dataset:
-    def test_inactive_when_data_dir_missing(self, tmp_path, monkeypatch):
-        import config
-        monkeypatch.setattr(config, 'DATA_DIR', tmp_path / 'nonexistent')
-        from modules.dashboard.health import _check_module3_dataset
-        result = _check_module3_dataset()
-        assert result['status'] == 'inactive'
-
-    def test_inactive_when_data_dir_empty(self, tmp_path, monkeypatch):
-        import config
-        monkeypatch.setattr(config, 'DATA_DIR', tmp_path)
-        from modules.dashboard.health import _check_module3_dataset
-        result = _check_module3_dataset()
-        assert result['status'] == 'inactive'
-
-    def test_active_when_families_present(self, tmp_path, monkeypatch):
-        import config
-        (tmp_path / 'Allaple.A').mkdir()
-        (tmp_path / 'Rbot_gen').mkdir()
-        monkeypatch.setattr(config, 'DATA_DIR', tmp_path)
-        from modules.dashboard.health import _check_module3_dataset
-        result = _check_module3_dataset()
-        assert result['status'] == 'active'
-        assert '2' in result['detail']   # "2 families found"
-
-
-class TestCheckModule4Enhancement:
-    def test_returns_active(self):
-        from modules.dashboard.health import _check_module4_enhancement
-        result = _check_module4_enhancement()
-        assert result['status'] == 'active'
-
-
-class TestCheckModule5Detection:
-    def test_inactive_when_model_missing(self, tmp_path, monkeypatch):
-        import config
-        monkeypatch.setattr(config, 'BEST_MODEL_PATH', tmp_path / 'missing.pt')
-        from modules.dashboard.health import _check_module5_detection
-        result = _check_module5_detection()
-        assert result['status'] == 'inactive'
-
-    def test_inactive_when_class_names_missing(self, tmp_path, monkeypatch):
-        import config
-        import torch
-        from modules.detection.model import MalTwinCNN
-        # Create a real model file
-        pt_path = tmp_path / 'best_model.pt'
-        model = MalTwinCNN(num_classes=25)
-        torch.save(model.state_dict(), pt_path)
-        monkeypatch.setattr(config, 'BEST_MODEL_PATH', pt_path)
-        monkeypatch.setattr(config, 'CLASS_NAMES_PATH', tmp_path / 'missing.json')
-        from modules.dashboard.health import _check_module5_detection
-        result = _check_module5_detection()
-        assert result['status'] == 'inactive'
-
-    def test_active_when_model_and_class_names_present(self, tmp_path, monkeypatch):
-        import config, json
-        import torch
-        from modules.detection.model import MalTwinCNN
-        pt_path    = tmp_path / 'best_model.pt'
-        names_path = tmp_path / 'class_names.json'
-        model      = MalTwinCNN(num_classes=25)
-        torch.save(model.state_dict(), pt_path)
-        names_path.write_text(json.dumps({'class_names': [f'F{i}' for i in range(25)]}))
-        monkeypatch.setattr(config, 'BEST_MODEL_PATH', pt_path)
-        monkeypatch.setattr(config, 'CLASS_NAMES_PATH', names_path)
-        from modules.dashboard.health import _check_module5_detection
-        # Reload module to pick up monkeypatched config
-        import importlib, modules.dashboard.health as h
-        importlib.reload(h)
-        result = h._check_module5_detection()
-        assert result['status'] == 'active'
-
-
-class TestCheckModule6Dashboard:
-    def test_always_active(self):
-        from modules.dashboard.health import _check_module6_dashboard
-        result = _check_module6_dashboard()
-        assert result['status'] == 'active'
-
-
-class TestCheckModule7Gradcam:
-    def test_returns_dict_with_required_keys(self):
-        from modules.dashboard.health import _check_module7_gradcam
-        result = _check_module7_gradcam()
-        assert 'status' in result
-        assert 'detail' in result
-        assert 'emoji' in result
-
-    def test_status_is_valid_value(self):
-        from modules.dashboard.health import _check_module7_gradcam
-        result = _check_module7_gradcam()
-        assert result['status'] in ('active', 'inactive', 'error')
-
-    def test_active_or_inactive_when_captum_installed(self):
-        """Captum is installed (Step 1 requirement) — should not be 'error'."""
-        try:
-            import captum   # noqa
-            from modules.dashboard.health import _check_module7_gradcam
-            result = _check_module7_gradcam()
-            assert result['status'] in ('active', 'inactive')
-        except ImportError:
-            pytest.skip("Captum not installed")
-
-
-class TestCheckModule8Reporting:
-    def test_inactive_when_mitre_json_missing(self, tmp_path, monkeypatch):
-        import config
-        monkeypatch.setattr(config, 'MITRE_JSON_PATH', tmp_path / 'missing.json')
-        from modules.dashboard.health import _check_module8_reporting
-        result = _check_module8_reporting()
-        assert result['status'] == 'inactive'
-
-    def test_active_when_mitre_json_present(self, tmp_path, monkeypatch):
-        import config, json
-        mitre_path = tmp_path / 'mitre.json'
-        # Write all 25 families
-        db = {f'Family_{i}': {'tactics': [], 'techniques': [], 'description': ''} for i in range(25)}
-        mitre_path.write_text(json.dumps(db))
-        monkeypatch.setattr(config, 'MITRE_JSON_PATH', mitre_path)
-        from modules.dashboard import health
-        import importlib; importlib.reload(health)
-        result = health._check_module8_reporting()
-        assert result['status'] == 'active'
+    def test_default_args_used_is_empty_dict(self):
+        s = TrainingJobState()
+        assert s.args_used == {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# get_all_module_statuses
+# TrainingJob lifecycle
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestGetAllModuleStatuses:
-    def test_returns_list_of_eight(self):
-        from modules.dashboard.health import get_all_module_statuses
-        # Clear cache before calling to ensure fresh result
-        get_all_module_statuses.clear()
-        results = get_all_module_statuses()
-        assert len(results) == 8
+class TestTrainingJobLifecycle:
+    def _run_to_completion(self, job: TrainingJob, timeout: float = 10.0) -> None:
+        """Poll until job finishes or timeout expires."""
+        start = time.time()
+        while job.is_running():
+            job.poll()
+            if time.time() - start > timeout:
+                job.stop()
+                pytest.fail("Job did not complete within timeout")
+            time.sleep(0.1)
+        # Final poll to flush remaining lines
+        job.poll()
 
-    def test_each_entry_has_required_keys(self):
-        from modules.dashboard.health import get_all_module_statuses
-        get_all_module_statuses.clear()
-        results = get_all_module_statuses()
-        for r in results:
-            assert 'id' in r
-            assert 'name' in r
-            assert 'status' in r
-            assert 'detail' in r
-            assert 'emoji' in r
+    def test_is_not_running_before_start(self):
+        job = TrainingJob()
+        assert job.is_running() is False
 
-    def test_all_statuses_are_valid_values(self):
-        from modules.dashboard.health import get_all_module_statuses
-        get_all_module_statuses.clear()
-        results = get_all_module_statuses()
-        for r in results:
-            assert r['status'] in ('active', 'inactive', 'error'), \
-                f"Module {r['id']} has invalid status: {r['status']}"
+    def test_is_running_after_start(self, fake_train_script):
+        job = TrainingJob()
+        job.start({'_script': str(fake_train_script)})
+        # Patch: override command building for test
+        # We test via a different approach — use monkeypatch in next test
+        job.stop()
 
-    def test_module_ids_are_m1_through_m8(self):
-        from modules.dashboard.health import get_all_module_statuses
-        get_all_module_statuses.clear()
-        results = get_all_module_statuses()
-        ids = [r['id'] for r in results]
-        assert ids == ['M1', 'M2', 'M3', 'M4', 'M5', 'M6', 'M7', 'M8']
+    def test_start_raises_if_already_running(self, fake_train_script, monkeypatch):
+        """Starting a second job while one is running must raise RuntimeError."""
+        job = TrainingJob()
+        # Monkeypatch _build_cmd to use our fake script
+        monkeypatch.setattr(
+            job, '_build_cmd',
+            lambda args: [sys.executable, str(fake_train_script)],
+            raising=False,
+        )
+        # Manually start process
+        import subprocess
+        job._process = subprocess.Popen(
+            [sys.executable, str(fake_train_script)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        job.state.status = 'running'
+        from threading import Thread
+        job._reader = Thread(target=job._read_output, daemon=True)
+        job._reader.start()
 
-    def test_does_not_raise(self):
-        """get_all_module_statuses must never raise regardless of environment."""
-        from modules.dashboard.health import get_all_module_statuses
-        get_all_module_statuses.clear()
-        try:
-            results = get_all_module_statuses()
-        except Exception as e:
-            pytest.fail(f"get_all_module_statuses raised: {e}")
+        with pytest.raises(RuntimeError, match="already running"):
+            job.start({})
 
-    def test_m6_is_always_active(self):
-        from modules.dashboard.health import get_all_module_statuses
-        get_all_module_statuses.clear()
-        results = get_all_module_statuses()
-        m6 = next(r for r in results if r['id'] == 'M6')
-        assert m6['status'] == 'active'
+        job.stop()
 
-    def test_m2_is_always_active(self):
-        """M2 is fully implemented — should always be active."""
-        from modules.dashboard.health import get_all_module_statuses
-        get_all_module_statuses.clear()
-        results = get_all_module_statuses()
-        m2 = next(r for r in results if r['id'] == 'M2')
-        assert m2['status'] == 'active'
+    def test_poll_returns_tuple_of_three(self, fake_train_script):
+        job = TrainingJob()
+        import subprocess, threading
+        job._process = subprocess.Popen(
+            [sys.executable, str(fake_train_script)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        job.state.status = 'running'
+        job._reader = threading.Thread(target=job._read_output, daemon=True)
+        job._reader.start()
 
-    def test_m4_is_always_active(self):
-        """M4 is fully implemented — should always be active."""
-        from modules.dashboard.health import get_all_module_statuses
-        get_all_module_statuses.clear()
-        results = get_all_module_statuses()
-        m4 = next(r for r in results if r['id'] == 'M4')
-        assert m4['status'] == 'active'
+        result = job.poll()
+        assert len(result) == 3
+        job.stop()
+
+    def test_state_status_running_while_process_alive(self, fake_train_script):
+        job = TrainingJob()
+        import subprocess, threading
+        job._process = subprocess.Popen(
+            [sys.executable, str(fake_train_script)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        job.state.status = 'running'
+        job._reader = threading.Thread(target=job._read_output, daemon=True)
+        job._reader.start()
+        assert job.state.status == 'running'
+        job.stop()
+
+    def test_log_lines_accumulate_across_polls(self, fake_train_script):
+        import subprocess, threading, time
+        job = TrainingJob()
+        job._process = subprocess.Popen(
+            [sys.executable, str(fake_train_script)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        job.state.status = 'running'
+        job._reader = threading.Thread(target=job._read_output, daemon=True)
+        job._reader.start()
+
+        # Poll multiple times while script runs
+        deadline = time.time() + 8
+        while job.is_running() and time.time() < deadline:
+            job.poll()
+            time.sleep(0.2)
+        job.poll()   # final flush
+
+        assert len(job.state.log_lines) > 0
+
+    def test_state_status_completed_on_exit_zero(self, fake_train_script):
+        import subprocess, threading, time
+        job = TrainingJob()
+        job._process = subprocess.Popen(
+            [sys.executable, str(fake_train_script)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        job.state.status = 'running'
+        job._reader = threading.Thread(target=job._read_output, daemon=True)
+        job._reader.start()
+
+        deadline = time.time() + 8
+        while job.is_running() and time.time() < deadline:
+            job.poll()
+            time.sleep(0.1)
+        job.poll()
+
+        assert job.state.status == 'completed'
+        assert job.state.return_code == 0
+
+    def test_state_status_failed_on_nonzero_exit(self, fail_train_script):
+        import subprocess, threading, time
+        job = TrainingJob()
+        job._process = subprocess.Popen(
+            [sys.executable, str(fail_train_script)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        job.state.status = 'running'
+        job._reader = threading.Thread(target=job._read_output, daemon=True)
+        job._reader.start()
+
+        deadline = time.time() + 5
+        while job.is_running() and time.time() < deadline:
+            job.poll()
+            time.sleep(0.1)
+        job.poll()
+
+        assert job.state.status == 'failed'
+        assert job.state.return_code == 1
+
+    def test_stop_sets_status_stopped(self, fake_train_script):
+        import subprocess, threading
+        job = TrainingJob()
+        job._process = subprocess.Popen(
+            [sys.executable, '-c', 'import time; time.sleep(30)'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        job.state.status = 'running'
+        job._reader = threading.Thread(target=job._read_output, daemon=True)
+        job._reader.start()
+
+        job.stop()
+        assert job.state.status == 'stopped'
+        assert job.is_running() is False
+
+    def test_stop_on_non_running_job_does_not_raise(self):
+        job = TrainingJob()
+        job.stop()   # should not raise
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# get_system_stats
+# Helper functions
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestGetSystemStats:
-    def test_returns_dict_with_required_keys(self):
-        from modules.dashboard.health import get_system_stats
-        stats = get_system_stats()
-        required = {
-            'cpu_pct', 'mem_pct', 'mem_used_gb',
-            'mem_total_gb', 'uptime_str', 'device', 'error',
-        }
-        assert required.issubset(stats.keys())
+class TestHelperFunctions:
+    def test_estimate_progress_zero_when_no_epoch_lines(self):
+        from modules.dashboard.pages.training import _estimate_progress
+        assert _estimate_progress([], 30) == pytest.approx(0.05)
 
-    def test_cpu_pct_in_valid_range(self):
-        from modules.dashboard.health import get_system_stats
-        stats = get_system_stats()
-        if not stats['error']:
-            assert 0.0 <= stats['cpu_pct'] <= 100.0
+    def test_estimate_progress_parses_epoch_line(self):
+        from modules.dashboard.pages.training import _estimate_progress
+        lines = ["Epoch 015/030 | Train Loss: 0.123 | Val Acc: 0.8500"]
+        assert _estimate_progress(lines, 30) == pytest.approx(0.5)
 
-    def test_mem_pct_in_valid_range(self):
-        from modules.dashboard.health import get_system_stats
-        stats = get_system_stats()
-        if not stats['error']:
-            assert 0.0 <= stats['mem_pct'] <= 100.0
+    def test_estimate_progress_capped_at_one(self):
+        from modules.dashboard.pages.training import _estimate_progress
+        lines = ["Epoch 030/030 | Train Loss: 0.050 | Val Acc: 0.9700"]
+        assert _estimate_progress(lines, 30) == pytest.approx(1.0)
 
-    def test_mem_used_le_mem_total(self):
-        from modules.dashboard.health import get_system_stats
-        stats = get_system_stats()
-        if not stats['error']:
-            assert stats['mem_used_gb'] <= stats['mem_total_gb']
+    def test_estimate_progress_handles_malformed_lines(self):
+        from modules.dashboard.pages.training import _estimate_progress
+        lines = ["Epoch GARBAGE | blah blah", "no epoch here"]
+        result = _estimate_progress(lines, 30)
+        assert 0.0 <= result <= 1.0
 
-    def test_device_is_nonempty_string(self):
-        from modules.dashboard.health import get_system_stats
-        stats = get_system_stats()
-        assert isinstance(stats['device'], str)
-        assert len(stats['device']) > 0
+    def test_parse_best_val_acc_returns_none_when_no_lines(self):
+        from modules.dashboard.pages.training import _parse_best_val_acc
+        assert _parse_best_val_acc([]) is None
 
-    def test_error_flag_is_bool(self):
-        from modules.dashboard.health import get_system_stats
-        stats = get_system_stats()
-        assert isinstance(stats['error'], bool)
+    def test_parse_best_val_acc_finds_val_acc(self):
+        from modules.dashboard.pages.training import _parse_best_val_acc
+        lines = [
+            "Epoch 001/030 | Val Acc: 0.5500",
+            "  ★ New best model saved (val_acc=0.5500)",
+            "Epoch 002/030 | Val Acc: 0.7200",
+            "  ★ New best model saved (val_acc=0.7200)",
+        ]
+        result = _parse_best_val_acc(lines)
+        assert result == pytest.approx(0.72)
 
-    def test_does_not_raise_when_psutil_missing(self, monkeypatch):
-        """If psutil is not importable, stats must return error=True, not raise."""
-        import builtins
-        real_import = builtins.__import__
+    def test_parse_best_val_acc_returns_highest(self):
+        from modules.dashboard.pages.training import _parse_best_val_acc
+        lines = [
+            "★ New best model saved (val_acc=0.4500)",
+            "★ New best model saved (val_acc=0.8900)",
+            "★ New best model saved (val_acc=0.7200)",
+        ]
+        result = _parse_best_val_acc(lines)
+        assert result == pytest.approx(0.89)
 
-        def mock_import(name, *args, **kwargs):
-            if name == 'psutil':
-                raise ImportError("mocked missing psutil")
-            return real_import(name, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, '__import__', mock_import)
-        from modules.dashboard import health
-        import importlib; importlib.reload(health)
-        stats = health.get_system_stats()
-        assert stats['error'] is True
+    def test_parse_best_val_acc_handles_malformed(self):
+        from modules.dashboard.pages.training import _parse_best_val_acc
+        lines = ["val_acc=NOTANUMBER", "val_acc="]
+        result = _parse_best_val_acc(lines)
+        assert result is None
 ```
 
 ---
@@ -899,49 +1003,54 @@ class TestGetSystemStats:
 ## Definition of Done
 
 ```bash
-# Step 4 tests
-pytest tests/test_health.py -v
+# Step 5 tests
+pytest tests/test_training_manager.py -v
 # Expected: all tests pass, 0 failures
 
 # Full regression suite
 pytest tests/ -v -m "not integration"
-# Expected: 0 failures
+# Expected: 0 failures across all steps
 
 # Import smoke tests
-python -c "from modules.dashboard.health import get_all_module_statuses, get_system_stats"
-python -c "import psutil; print('psutil OK')"
+python -c "from modules.training_manager import TrainingJob, TrainingJobState"
+python -c "from modules.dashboard.pages.training import render"
+python -c "from modules.dashboard import state; assert hasattr(state, 'KEY_TRAINING_JOB')"
 
-# Dashboard launch — verify all changes
+# Dashboard launch — verify training page
 streamlit run modules/dashboard/app.py --server.port 8501
 
-# Verify on home page:
-#   ✓ Module status table shows live status (not hardcoded strings)
-#   ✓ M2, M4, M6 show ✅ Active
-#   ✓ M5 shows ⚠️ Inactive (if no model trained) or ✅ Active (if trained)
-#   ✓ M7 shows ✅ Active or ⚠️ Inactive based on Captum + model
-#   ✓ M8 shows ✅ Active (if mitre_ics_mapping.json has 25 families)
-#   ✓ System Resources panel shows real CPU %, RAM %, uptime — not placeholder text
-#   ✓ Sidebar shows ⚠️ suffix on Dataset Gallery if dataset missing
-#   ✓ Sidebar shows ⚠️ suffix on Detection if no file uploaded or no model
-#   ✓ Status refreshes every 30 seconds (caption visible at bottom of table)
+# Verify on training page:
+#   ✓ 🏋️ Model Training appears in sidebar (6 nav options total)
+#   ✓ Hyperparameter form renders correctly
+#   ✓ Start button disabled when training is running
+#   ✓ Stop button disabled when not running
+#   ✓ Clicking Start without dataset shows error (not crash)
+#   ✓ Sidebar shows "🏋️ Training in progress…" while running
+#   ✓ Log output appears and updates every ~2 seconds
+#   ✓ After completion: status banner turns green, output files listed
+#   ✓ After completion: model auto-loaded into session state
+#   ✓ Can navigate away and return — log is still there
 ```
 
 ### Checklist
 
-- [ ] `pytest tests/test_health.py -v` — 0 failures
+- [ ] `pytest tests/test_training_manager.py -v` — 0 failures
 - [ ] All earlier tests still pass
-- [ ] `modules/dashboard/health.py` exists
-- [ ] `psutil` in `requirements.txt`
-- [ ] `state.py` has `KEY_APP_START_TIME` constant
-- [ ] `init_session_state()` sets `KEY_APP_START_TIME` to `datetime.utcnow()` on first run only
-- [ ] `get_all_module_statuses()` decorated with `@st.cache_data(ttl=30)`
-- [ ] All 8 check functions return dict with `status`, `detail`, `emoji` keys
-- [ ] Status values are strictly `'active'`, `'inactive'`, or `'error'`
-- [ ] No check function raises — all wrapped in try/except
-- [ ] Home page module table is styled (colour-coded Status column)
-- [ ] Home page shows real CPU/RAM/uptime metrics — not "Not Configured" stub
-- [ ] Sidebar labels include `⚠️` suffix for unavailable pages
-- [ ] Navigation routing still works for all 5 pages (no KeyError from ⚠️ suffix)
+- [ ] `modules/training_manager.py` exists with `TrainingJob` and `TrainingJobState`
+- [ ] `modules/dashboard/pages/training.py` exists
+- [ ] `state.py` has `KEY_TRAINING_JOB` and `KEY_TRAINING_STATE`
+- [ ] `state.py` has `is_training_running()` helper
+- [ ] `app.py` sidebar has 6 navigation options including `"🏋️ Model Training"`
+- [ ] `app.py` routes `"🏋️ Model Training"` to `training.render()`
+- [ ] Training runs `scripts/train.py` as subprocess — not inline
+- [ ] `subprocess.Popen` uses `stdout=PIPE, stderr=STDOUT, text=True, bufsize=1`
+- [ ] Page auto-reruns every 2 seconds while training is running
+- [ ] Navigating away does not kill the subprocess
+- [ ] Stop button sends SIGTERM then SIGKILL after 5s
+- [ ] Progress bar estimates from epoch log lines
+- [ ] Best val_acc extracted and shown as metric
+- [ ] After successful training, model auto-loaded into session_state
+- [ ] Dataset missing → `st.error()` shown, page returns early — no crash
 
 ---
 
@@ -949,14 +1058,16 @@ streamlit run modules/dashboard/app.py --server.port 8501
 
 | Bug | Symptom | Fix |
 |---|---|---|
-| `get_all_module_statuses()` not cleared between tests | Stale cached result from previous test poisons next test | Call `get_all_module_statuses.clear()` at the start of each test that needs fresh state |
-| `monkeypatch` on `config` not reflected inside cached function | Health check still reads old path after monkeypatch | `importlib.reload(health)` after monkeypatching config attributes |
-| `subprocess.run(['docker', 'info'])` blocking for >2s | Streamlit appears frozen during M1 check | Always use `timeout=2` in subprocess calls |
-| Sidebar radio `⚠️` suffix causes routing KeyError | `page` value is `"🔍 Malware Detection ⚠️"` but routing checks for `"🔍 Malware Detection"` | Map display labels → internal keys using `internal_keys[selected_index]` |
-| `psutil.cpu_percent(interval=None)` returns 0.0 | CPU shows 0% always | Use `interval=0.1` — tiny blocking interval gives real reading |
-| `datetime.utcnow()` called every rerun for uptime start | Uptime resets to 0 on every Streamlit rerun | Only set `KEY_APP_START_TIME` when it is `None` — the `if` guard in `init_session_state()` |
-| `@st.cache_data` on `get_system_stats` | CPU/RAM values never update | Do NOT cache `get_system_stats` — it must be called live each render |
+| Running training inline (not subprocess) | Dashboard freezes for entire training duration | Always use `subprocess.Popen` — never call `train()` directly |
+| `subprocess.PIPE` on stderr separately | stderr output lost; error messages invisible | Use `stderr=subprocess.STDOUT` to merge stderr into stdout |
+| `bufsize=0` or default | Output appears in large chunks, not line by line | Use `bufsize=1` (line-buffered) with `text=True` |
+| `st.rerun()` called unconditionally | Infinite rerun loop even when not training | Only call inside `if state.is_training_running():` block |
+| `time.sleep(_POLL_INTERVAL_S)` before `st.rerun()` | `sleep` blocks the Streamlit server thread briefly | Acceptable at 2s; do not increase. Never sleep in a non-training render. |
+| `TrainingJob` created fresh on every rerun | Job lost between reruns; log disappears | Store job in `session_state[KEY_TRAINING_JOB]` — retrieve, don't recreate |
+| `job.poll()` not called before reading `state.log_lines` | Log display is always one poll behind | Always call `job.poll()` at the top of `_render_log_panel()` |
+| Daemon thread reading stdout keeps process alive | Process appears finished but output still queued | Use `None` sentinel in queue from `_read_output` to signal EOF |
+| Form submit button outside `st.form` | Streamlit `StreamlitAPIException` | Start/Stop buttons must be `st.form_submit_button` inside the form, or `st.button` outside it — not mixed |
 
 ---
 
-*Step 4 complete → Step 5: Dashboard-triggered training flow with live progress display.*
+*Step 5 complete → Step 6 (final): Integration verification, SRS compliance audit, and cleanup.*
