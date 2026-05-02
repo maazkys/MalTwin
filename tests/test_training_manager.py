@@ -85,6 +85,14 @@ class TestTrainingJobState:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestTrainingJobLifecycle:
+    def _patch_cmd(self, job: TrainingJob, script_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(
+            job,
+            "_build_cmd",
+            lambda args: [sys.executable, str(script_path)],
+            raising=False,
+        )
+
     def _run_to_completion(self, job: TrainingJob, timeout: float = 10.0) -> None:
         """Poll until job finishes or timeout expires."""
         start = time.time()
@@ -101,58 +109,66 @@ class TestTrainingJobLifecycle:
         job = TrainingJob()
         assert job.is_running() is False
 
-    def test_is_running_after_start(self, fake_train_script):
+    def test_is_running_after_start(self, fake_train_script, monkeypatch):
         job = TrainingJob()
-        job.start({'_script': str(fake_train_script)})
+        self._patch_cmd(job, fake_train_script, monkeypatch)
+        job.start({})
         assert job.is_running() is True
         job.stop()
 
-    def test_start_raises_if_already_running(self, fake_train_script):
+    def test_start_raises_if_already_running(self, fake_train_script, monkeypatch):
         """Starting a second job while one is running must raise RuntimeError."""
         job = TrainingJob()
-        job.start({'_script': str(fake_train_script)})
+        self._patch_cmd(job, fake_train_script, monkeypatch)
+        job.start({})
         with pytest.raises(RuntimeError, match="already running"):
-            job.start({'_script': str(fake_train_script)})
+            job.start({})
         job.stop()
 
-    def test_poll_returns_tuple_of_three(self, fake_train_script):
+    def test_poll_returns_tuple_of_three(self, fake_train_script, monkeypatch):
         job = TrainingJob()
-        job.start({'_script': str(fake_train_script)})
+        self._patch_cmd(job, fake_train_script, monkeypatch)
+        job.start({})
         result = job.poll()
         assert len(result) == 3
         job.stop()
 
-    def test_state_status_running_while_process_alive(self, fake_train_script):
+    def test_state_status_running_while_process_alive(self, fake_train_script, monkeypatch):
         job = TrainingJob()
-        job.start({'_script': str(fake_train_script)})
+        self._patch_cmd(job, fake_train_script, monkeypatch)
+        job.start({})
         assert job.state.status == 'running'
         job.stop()
 
-    def test_log_lines_accumulate_across_polls(self, fake_train_script):
+    def test_log_lines_accumulate_across_polls(self, fake_train_script, monkeypatch):
         job = TrainingJob()
-        job.start({'_script': str(fake_train_script)})
+        self._patch_cmd(job, fake_train_script, monkeypatch)
+        job.start({})
         self._run_to_completion(job)
         assert len(job.state.log_lines) > 0
 
-    def test_state_status_completed_on_exit_zero(self, fake_train_script):
+    def test_state_status_completed_on_exit_zero(self, fake_train_script, monkeypatch):
         job = TrainingJob()
-        job.start({'_script': str(fake_train_script)})
+        self._patch_cmd(job, fake_train_script, monkeypatch)
+        job.start({})
         self._run_to_completion(job)
         assert job.state.status == 'completed'
         assert job.state.return_code == 0
 
-    def test_state_status_failed_on_nonzero_exit(self, fail_train_script):
+    def test_state_status_failed_on_nonzero_exit(self, fail_train_script, monkeypatch):
         job = TrainingJob()
-        job.start({'_script': str(fail_train_script)})
+        self._patch_cmd(job, fail_train_script, monkeypatch)
+        job.start({})
         self._run_to_completion(job)
         assert job.state.status == 'failed'
         assert job.state.return_code == 1
 
-    def test_stop_sets_status_stopped(self, tmp_path):
+    def test_stop_sets_status_stopped(self, tmp_path, monkeypatch):
         script = tmp_path / "sleep.py"
         script.write_text("import time; time.sleep(30)")
         job = TrainingJob()
-        job.start({'_script': str(script)})
+        self._patch_cmd(job, script, monkeypatch)
+        job.start({})
         job.stop()
         assert job.state.status == 'stopped'
         assert job.is_running() is False

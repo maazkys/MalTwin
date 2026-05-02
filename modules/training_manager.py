@@ -63,8 +63,7 @@ class TrainingJob:
         self.state: TrainingJobState = TrainingJobState()
 
     def _build_cmd(self, args: dict) -> list[str]:
-        script_override = args.get('_script')
-        script_path = Path(script_override) if script_override else Path('scripts') / 'train.py'
+        script_path = Path('scripts') / 'train.py'
         if not script_path.exists():
             raise FileNotFoundError(f"Training script not found: {script_path}")
 
@@ -114,7 +113,7 @@ class TrainingJob:
             cwd=Path.cwd(),
         )
 
-        args_used = {k: v for k, v in args.items() if k != '_script'}
+        args_used = dict(args)
         self.state = TrainingJobState(
             status='running',
             start_time=datetime.now(timezone.utc).isoformat(),

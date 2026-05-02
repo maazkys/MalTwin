@@ -27,6 +27,8 @@ from modules.training_manager import TrainingJob, TrainingJobState
 
 _POLL_INTERVAL_S = 2      # seconds between auto-reruns while training
 _MAX_LOG_LINES   = 300    # cap displayed log lines to avoid massive DOM
+_BATCH_SIZE_OPTIONS = [8, 16, 32, 64, 128]
+_OVERSAMPLE_OPTIONS = ['oversample_minority', 'sqrt_inverse', 'uniform']
 
 
 def render():
@@ -90,9 +92,9 @@ def _render_config_panel() -> None:
         )
         batch_size = st.selectbox(
             "Batch Size",
-            options=[8, 16, 32, 64, 128],
-            index=[8, 16, 32, 64, 128].index(
-                config.BATCH_SIZE if config.BATCH_SIZE in [8, 16, 32, 64, 128] else 32
+            options=_BATCH_SIZE_OPTIONS,
+            index=_BATCH_SIZE_OPTIONS.index(
+                config.BATCH_SIZE if config.BATCH_SIZE in _BATCH_SIZE_OPTIONS else 32
             ),
             disabled=is_running,
             help="Number of images per training batch.",
@@ -107,10 +109,10 @@ def _render_config_panel() -> None:
         )
         oversample = st.selectbox(
             "Oversampling Strategy",
-            options=['oversample_minority', 'sqrt_inverse', 'uniform'],
-            index=['oversample_minority', 'sqrt_inverse', 'uniform'].index(
+            options=_OVERSAMPLE_OPTIONS,
+            index=_OVERSAMPLE_OPTIONS.index(
                 config.OVERSAMPLE_STRATEGY
-                if config.OVERSAMPLE_STRATEGY in ['oversample_minority', 'sqrt_inverse', 'uniform']
+                if config.OVERSAMPLE_STRATEGY in _OVERSAMPLE_OPTIONS
                 else 'oversample_minority'
             ),
             disabled=is_running,
@@ -174,10 +176,10 @@ def _render_config_panel() -> None:
 
     # Config summary (shown while running)
     if is_running:
-        ts = get_training_state()
-        if ts and ts.args_used:
+        training_state = get_training_state()
+        if training_state and training_state.args_used:
             st.markdown("**Running with:**")
-            for k, v in ts.args_used.items():
+            for k, v in training_state.args_used.items():
                 st.caption(f"`{k}`: {v}")
 
 
@@ -191,19 +193,21 @@ def _render_log_panel() -> None:
         st.info("No training job started yet. Configure parameters and click **Start Training**.")
         return
 
-    ts: TrainingJobState = job.state
+    training_state: TrainingJobState = job.state
 
     # Poll for new output
     job.poll()
     _update_training_snapshot(job)
 
     # ── Status banner ─────────────────────────────────────────────────────────
-    if ts.status == 'running':
-        st.success(f"🟢 Training in progress — started {ts.start_time[:19]} UTC")
+    if training_state.status == 'running':
+        st.success(
+            f"🟢 Training in progress — started {training_state.start_time[:19]} UTC"
+        )
 
         # Elapsed time
         try:
-            started = datetime.fromisoformat(ts.start_time)
+            started = datetime.fromisoformat(training_state.start_time)
             if started.tzinfo is None:
                 started = started.replace(tzinfo=timezone.utc)
             elapsed = datetime.now(timezone.utc) - started
@@ -213,39 +217,44 @@ def _render_log_panel() -> None:
             pass
 
         st.progress(
-            _estimate_progress(ts.log_lines, ts.args_used.get('epochs', config.EPOCHS)),
+            _estimate_progress(
+                training_state.log_lines,
+                training_state.args_used.get('epochs', config.EPOCHS),
+            ),
             text="Training in progress…",
         )
 
-    elif ts.status == 'completed':
+    elif training_state.status == 'completed':
         st.success(
             f"✅ Training completed successfully "
-            f"(exit code 0) — finished {ts.end_time[:19]} UTC"
+            f"(exit code 0) — finished {training_state.end_time[:19]} UTC"
         )
         # Reload model into session state automatically
         _reload_model_after_training()
 
-    elif ts.status == 'failed':
+    elif training_state.status == 'failed':
         st.error(
-            f"🔴 Training failed (exit code {ts.return_code}). "
+            f"🔴 Training failed (exit code {training_state.return_code}). "
             "Check the log below for details."
         )
 
-    elif ts.status == 'stopped':
-        st.warning(f"⚠️ Training stopped by user — {ts.end_time[:19]} UTC")
+    elif training_state.status == 'stopped':
+        st.warning(
+            f"⚠️ Training stopped by user — {training_state.end_time[:19]} UTC"
+        )
 
     # ── Metrics extraction (parse log for best val_acc) ───────────────────────
-    best_val_acc = _parse_best_val_acc(ts.log_lines)
+    best_val_acc = _parse_best_val_acc(training_state.log_lines)
     if best_val_acc is not None:
         st.metric("Best Val Accuracy", f"{best_val_acc * 100:.2f}%")
 
     # ── Live log ──────────────────────────────────────────────────────────────
     st.markdown("**Output:**")
-    log_text = '\n'.join(ts.log_lines[-_MAX_LOG_LINES:])
+    log_text = '\n'.join(training_state.log_lines[-_MAX_LOG_LINES:])
     st.code(log_text or "(no output yet)", language=None)
 
     # ── Output files ──────────────────────────────────────────────────────────
-    if ts.status == 'completed':
+    if training_state.status == 'completed':
         st.markdown("**Generated files:**")
         for path, label in [
             (config.BEST_MODEL_PATH,    "Best model weights"),
