@@ -194,11 +194,8 @@ def _render_log_panel() -> None:
     ts: TrainingJobState = job.state
 
     # Poll for new output
-    if job.is_running():
-        job.poll()
-        _update_training_snapshot(job)
-    else:
-        _update_training_snapshot(job)
+    job.poll()
+    _update_training_snapshot(job)
 
     # ── Status banner ─────────────────────────────────────────────────────────
     if ts.status == 'running':
