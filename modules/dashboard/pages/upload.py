@@ -33,7 +33,7 @@ def render():
         label="Upload Binary File",
         type=["exe", "dll", "elf"],
         help=(
-            "Accepted formats: PE (.exe, .dll) or ELF binaries. "
+            "Accepted formats: PE (.exe, .dll) or ELF (.elf) binaries. "
             "ELF binaries have no extension — rename to .elf if needed. "
             f"Maximum file size: {config.MAX_UPLOAD_BYTES // (1024 * 1024)} MB."
         ),
