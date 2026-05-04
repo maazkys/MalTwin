@@ -94,13 +94,13 @@ def load_global_resources() -> None:
     # reset and reload. Handles CLI training completing mid-session.
     if st.session_state[state.KEY_MODEL_LOADED]:
         try:
-            stored_mtime = st.session_state.get('_model_mtime', 0)
+            stored_mtime = st.session_state.get(state.KEY_MODEL_MTIME, 0)
             current_mtime = config.BEST_MODEL_PATH.stat().st_mtime
             if current_mtime > stored_mtime + 1:   # +1s tolerance
                 # Model file changed — reset and reload
                 st.session_state[state.KEY_MODEL]        = None
                 st.session_state[state.KEY_MODEL_LOADED] = False
-                st.session_state['_model_mtime']         = 0
+                st.session_state[state.KEY_MODEL_MTIME]  = 0
         except Exception:
             pass
 
@@ -116,7 +116,7 @@ def load_global_resources() -> None:
                 st.session_state[state.KEY_MODEL]        = model
                 st.session_state[state.KEY_MODEL_LOADED] = True
                 st.session_state[state.KEY_DEVICE_INFO]  = str(config.DEVICE)
-                st.session_state['_model_mtime']         = config.BEST_MODEL_PATH.stat().st_mtime
+                st.session_state[state.KEY_MODEL_MTIME]  = config.BEST_MODEL_PATH.stat().st_mtime
         except FileNotFoundError:
             st.session_state[state.KEY_MODEL_LOADED] = False
 

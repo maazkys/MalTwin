@@ -19,6 +19,7 @@ KEY_APP_START_TIME = 'app_start_time'   # datetime — set once at first run
 KEY_TRAINING_JOB   = 'training_job'     # TrainingJob instance or None
 KEY_TRAINING_STATE = 'training_state'   # TrainingJobState dict snapshot or None
 KEY_HEATMAP      = 'gradcam_heatmap'   # dict from generate_gradcam() or None
+KEY_MODEL_MTIME  = 'model_mtime'       # float epoch seconds for model file
 
 
 def init_session_state() -> None:
@@ -38,6 +39,7 @@ def init_session_state() -> None:
         KEY_TRAINING_JOB:   None,
         KEY_TRAINING_STATE: None,
         KEY_HEATMAP:      None,
+        KEY_MODEL_MTIME:  0,
     }
     for key, default in defaults.items():
         if key not in st.session_state:

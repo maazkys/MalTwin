@@ -31,6 +31,7 @@ def load_model(
 
     Raises:
         FileNotFoundError: if model_path does not exist.
+        ValueError:        if a checkpoint dict contains none of the expected keys.
         RuntimeError:      if weights cannot be loaded after all recovery attempts,
                            with a detailed diagnostic message.
     """
