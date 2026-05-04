@@ -237,8 +237,9 @@ def _render_log_panel() -> None:
 
     elif training_state.status == 'failed':
         st.error(
-            f"🔴 Training failed (exit code {training_state.return_code}). "
-            "Check the log below for details."
+            "Error: Training failed. "
+            f"Cause: The training process exited with code {training_state.return_code}. "
+            "Action: Review the log below and verify dataset paths and dependencies."
         )
 
     elif training_state.status == 'stopped':
@@ -281,12 +282,17 @@ def _start_training(args: dict) -> None:
         _update_training_snapshot(job)
     except FileNotFoundError as e:
         st.error(
-            f"Error: {e}. "
-            "Action: Ensure scripts/train.py exists and you are running "
-            "the dashboard from the repo root directory."
+            "Error: Training script not found. "
+            f"Cause: {e}. "
+            "Action: Ensure scripts/train.py exists and run the dashboard "
+            "from the repo root directory."
         )
     except RuntimeError as e:
-        st.error(f"Error: {e}")
+        st.error(
+            "Error: Training failed to start. "
+            f"Cause: {e}. "
+            "Action: Check your training configuration and system resources, then retry."
+        )
     except Exception as e:
         st.error(
             "Error: Failed to start training. "
