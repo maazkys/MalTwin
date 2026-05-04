@@ -13,7 +13,7 @@
 
 | FR-ID | Requirement | Implementation | Status |
 |-------|-------------|----------------|--------|
-| FR1.1 | Display operational status of all 8 modules | `modules/dashboard/health.py` → `get_all_module_statuses()` cached 30s; styled table in `home.py` `_render_module_status()` | ✅ Implemented |
+| FR1.1 | Display operational status of all 8 modules | `modules/dashboard/health.py` → `get_all_module_statuses()` cached 30s; styled table in `home.py` `_render_module_status()` | ✅ Implemented* |
 | FR1.2 | Display cumulative detection statistics | `db.py` `get_detection_stats()` reads SQLite + `eval_metrics.json`; rendered as `st.metric` in `home.py` | ✅ Implemented |
 | FR1.3 | Persistent sidebar navigation | `app.py` `render_sidebar()` — 6-page radio nav; ⚠️ suffix on unavailable pages | ✅ Implemented |
 | FR1.4 | Scrollable feed of 5 most recent detections | `home.py` `_render_history_section()` — filterable table with sort, family, confidence, date range, CSV export | ✅ Implemented (exceeds spec) |
@@ -140,7 +140,7 @@
 | M2 | Read bytes, reshape to 2D array | FE-2 | ✅ |
 | M2 | Render 128×128 grayscale PNG | FE-3 | ✅ |
 | M2 | Compute SHA-256 | FE-4 | ✅ |
-| M3 | Source from Malimg dataset | FE-1 | ✅ (Malimg only; VirusShare/IoT-23 deferred) |
+| M3 | Source from Malimg dataset | FE-1 | ✅* (Malimg only; VirusShare/IoT-23 deferred) |
 | M3 | Normalise pixels, encode labels | FE-2 | ✅ |
 | M3 | Stratified train/val/test split | FE-3 | ✅ |
 | M3 | Validate dataset integrity | FE-4 | ✅ |
@@ -183,3 +183,18 @@
 
 **All deferred items are exclusively Digital Twin (M1) related.**  
 The ML pipeline, dashboard, XAI, and reporting are fully implemented.
+
+---
+
+## Deviation Footnotes
+
+*FR1.1 TTL deviation: SRS specifies 5-second refresh. Implementation uses 30-second
+cache TTL (health.py:225) to avoid excessive filesystem polling during normal use.
+Functionally equivalent for research deployment. Would require architectural change
+(websocket or server-sent events) to achieve true 5-second push updates in Streamlit.
+
+*SI-5 deviation: SRS specifies PyTorch ImageFolder for dataset loading.
+Implementation uses a custom MalimgDataset class (modules/dataset/loader.py)
+that provides stratified splitting, class count tracking, and integration
+with WeightedRandomSampler — capabilities ImageFolder does not natively
+support. This is an intentional improvement over the specification.

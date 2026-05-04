@@ -130,6 +130,73 @@ def log_detection_event(
                 print(f"[MalTwin] DB write failed after retry: {e}", file=sys.stderr)
 
 
+def log_report_event(
+    db_path: Path,
+    detection_event_id: int | None,
+    sha256: str,
+    report_format: str,
+    gradcam_included: bool,
+) -> None:
+    """
+    Log a forensic report generation event. UC-03 postcondition.
+    Never raises — a DB failure must not block the download.
+
+    Args:
+        detection_event_id: id of the detection_events row (None if unknown).
+        sha256:             SHA-256 of the analyzed binary.
+        report_format:      'PDF' or 'JSON'.
+        gradcam_included:   True if Grad-CAM heatmap was embedded.
+    """
+    # Ensure the report_events table exists first
+    _ensure_report_table(db_path)
+
+    timestamp = datetime.utcnow().isoformat()
+    sql = """
+        INSERT INTO report_events
+            (timestamp, detection_event_id, sha256, report_format, gradcam_included)
+        VALUES (?, ?, ?, ?, ?)
+    """
+    params = (
+        timestamp,
+        detection_event_id,
+        sha256,
+        report_format,
+        1 if gradcam_included else 0,
+    )
+    for attempt in range(2):
+        try:
+            with get_connection(db_path) as conn:
+                conn.execute(sql, params)
+            return
+        except Exception as e:
+            if attempt == 0:
+                time.sleep(0.1)
+            else:
+                print(f"[MalTwin] Report log write failed: {e}", file=sys.stderr)
+
+
+def _ensure_report_table(db_path: Path) -> None:
+    """Create report_events table if it does not exist. Idempotent."""
+    try:
+        with get_connection(db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS report_events (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp           TEXT    NOT NULL,
+                    detection_event_id  INTEGER,
+                    sha256              TEXT    NOT NULL,
+                    report_format       TEXT    NOT NULL,
+                    gradcam_included    INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_report_sha256 "
+                "ON report_events(sha256)"
+            )
+    except Exception as e:
+        print(f"[MalTwin] Failed to create report_events table: {e}", file=sys.stderr)
+
+
 def get_recent_events(db_path: Path, limit: int = 5) -> list[dict]:
     """
     Return the `limit` most recent detection events, newest first.

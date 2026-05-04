@@ -217,6 +217,64 @@ class TestInferenceHelpers:
 # Serialization
 # ===========================================================================
 
+@pytest.fixture()
+def num_classes():
+    return NUM_CLASSES
+
+
+# ===========================================================================
+# Load model — checkpoint format handling
+# ===========================================================================
+
+class TestLoadModel:
+
+    def test_loads_from_full_checkpoint_dict_model_state_key(self, tmp_path, num_classes):
+        """
+        Simulate exactly what trainer.py saves: a checkpoint dict with key 'model_state'.
+        This is the format saved to CHECKPOINT_DIR per epoch.
+        inference.py must handle it correctly.
+        """
+        from modules.detection.inference import load_model
+        from modules.detection.model import MalTwinCNN
+        model = MalTwinCNN(num_classes=num_classes)
+        pt_path = tmp_path / "epoch_001_acc0.8500.pt"
+        # Save exactly as trainer.py does
+        torch.save({
+            'epoch':           1,
+            'model_state':     model.state_dict(),   # ← the key that was missing
+            'optimizer_state': {'state': {}, 'param_groups': []},
+            'val_acc':         0.85,
+            'val_loss':        0.42,
+            'train_acc':       0.87,
+            'train_loss':      0.39,
+        }, pt_path)
+
+        loaded = load_model(model_path=pt_path, num_classes=num_classes, device=torch.device('cpu'))
+        assert isinstance(loaded, MalTwinCNN)
+        assert not loaded.training   # must be in eval mode
+
+        # Weights must match
+        orig_w   = model.block1.conv1.weight.data
+        loaded_w = loaded.block1.conv1.weight.data
+        torch.testing.assert_close(orig_w, loaded_w)
+
+    def test_load_model_raises_helpful_error_for_unknown_checkpoint_keys(self, tmp_path, num_classes):
+        """
+        A checkpoint dict with none of the known keys should raise ValueError
+        with a message that lists the keys found — not a generic KeyError.
+        """
+        from modules.detection.inference import load_model
+        pt_path = tmp_path / "weird_checkpoint.pt"
+        torch.save({'some_unknown_key': 'garbage', 'epoch': 42}, pt_path)
+
+        with pytest.raises(ValueError, match="Cannot find model weights"):
+            load_model(model_path=pt_path, num_classes=num_classes, device=torch.device('cpu'))
+
+
+# ===========================================================================
+# Serialization
+# ===========================================================================
+
 class TestModelSerialization:
 
     def test_save_and_reload_same_output(self, cnn, dummy_input, tmp_path):
