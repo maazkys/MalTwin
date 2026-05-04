@@ -31,7 +31,7 @@ def render():
     # SRS ref: FR3.1
     uploaded_file = st.file_uploader(
         label="Upload Binary File",
-        type=["exe", "dll"],
+        type=["exe", "dll", "elf"],
         help=(
             "Accepted formats: PE (.exe, .dll) or ELF binaries. "
             "ELF binaries have no extension — rename to .elf if needed. "
@@ -175,4 +175,3 @@ def _render_results() -> None:
         st.plotly_chart(fig, use_container_width=True)
 
     st.info("➡️ Navigate to **Malware Detection** in the sidebar to run analysis.")
-
