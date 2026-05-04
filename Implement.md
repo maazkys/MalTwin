@@ -1,754 +1,554 @@
-# MalTwin — Implementation Step 6: Final Integration & SRS Compliance Audit
-### SRS refs: All — this step verifies every FR, NFR, and UC is satisfied
+# MalTwin — Compliance Gap Fixes
+### Addressing all findings from the SRS compliance audit
 
-> This is the final step. No new modules. No new pages.
-> This step fixes the remaining small gaps, verifies the full system end-to-end,
-> and produces a compliance checklist you can hand to your supervisor.
-
----
-
-## What This Step Delivers
-
-| Item | Status before | Status after |
-|---|---|---|
-| `tests/test_integration.py` | Does not exist | End-to-end pipeline smoke tests |
-| `modules/dashboard/pages/detection.py` | Missing USE-3 error format on a few paths | All error messages follow USE-3 format |
-| `modules/dashboard/pages/home.py` | KPI cards read from DB only | Also reads `eval_metrics.json` for model accuracy |
-| `modules/dashboard/app.py` | No SEC-5 localhost warning | Startup warning when not bound to localhost |
-| `config.py` | Missing `CONFIDENCE_GREEN`, `CONFIDENCE_AMBER` (may exist) | Verified present; added if missing |
-| `data/mitre_ics_mapping.json` | Already seeded in Step 2 | Verified all 25 keys match training class names exactly |
-| `README.md` | Already exists | Updated with Steps 1–5 additions |
-| `SRS_COMPLIANCE.md` | Does not exist | Full FR/NFR/UC compliance matrix |
+> Apply these fixes after Steps 1–6 are complete.
+> Each fix is self-contained. Apply them in order — Fix 4 depends on Fix 3.
 
 ---
 
-## Part A — Small Code Fixes
+## Fix 1 — ELF Upload: Complete the UI gap (not just add `.elf`)
 
-These are targeted fixes for the remaining gaps identified in the SRS audit. Each is small — a few lines at most.
+### The problem
 
-### Fix 1: Verify `config.py` has confidence thresholds
+The PR added `.elf` to the `type` list, which helps for renamed files. But raw ELF binaries have **no extension** — a user cannot select them through the browser file picker at all. The SRS (FR3.1) explicitly requires ELF support.
 
-Open `config.py` and confirm these lines exist. Add them if missing:
+The fix has two parts: keep the extension list broad, and add a clear explanation in the UI so users know exactly what to do.
+
+### Change in `modules/dashboard/pages/upload.py`
+
+Replace the `st.file_uploader` call:
 
 ```python
-# Confidence thresholds for colour-coded UI (SRS FR5.2)
-CONFIDENCE_GREEN = float(os.getenv('MALTWIN_CONFIDENCE_GREEN', '0.80'))
-CONFIDENCE_AMBER = float(os.getenv('MALTWIN_CONFIDENCE_AMBER', '0.50'))
+    uploaded_file = st.file_uploader(
+        label="Upload Binary File",
+        type=["exe", "dll", "elf"],
+        help=(
+            "Accepted formats: PE (.exe, .dll) or ELF (.elf) binaries. "
+            "ELF binaries from Linux/IIoT systems have no extension by default — "
+            "rename them to .elf before uploading (e.g. mv malware malware.elf). "
+            f"Maximum file size: {config.MAX_UPLOAD_BYTES // (1024 * 1024)} MB. "
+            "Format is validated by magic bytes, not extension."
+        ),
+        key="binary_uploader",
+    )
 ```
 
-Also confirm `MITRE_JSON_PATH` exists:
-```python
-MITRE_JSON_PATH = BASE_DIR / 'data' / 'mitre_ics_mapping.json'
-```
+Then add an expander below the uploader (before `if uploaded_file is not None:`) with explicit ELF instructions:
 
-And `REPORTS_DIR`:
 ```python
-REPORTS_DIR = BASE_DIR / 'data' / 'reports'
-REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    with st.expander("ℹ️ Uploading ELF binaries (Linux/IIoT malware)", expanded=False):
+        st.markdown(
+            "ELF binaries from Linux-based IIoT devices (PLCs, routers, embedded systems) "
+            "typically have no file extension. To upload them:\n\n"
+            "1. Rename the file to add a `.elf` extension:\n"
+            "   ```bash\n"
+            "   mv suspicious_binary suspicious_binary.elf\n"
+            "   ```\n"
+            "2. Upload the renamed file using the uploader above.\n\n"
+            "The system validates format using ELF magic bytes (`\\x7fELF`), "
+            "not the file extension — the extension is only required by the browser file picker."
+        )
 ```
 
 ---
 
-### Fix 2: SEC-5 localhost warning in `app.py`
+## Fix 2 — Checkpoint format mismatch
 
-Add this check at the very top of `main()`, immediately after `configure_page()`:
+### The problem
 
+`trainer.py` saves per-epoch checkpoints with the key `model_state`:
 ```python
-def main() -> None:
-    configure_page()
-    _check_network_binding()   # ← add this line
-    state.init_session_state()
-    # ... rest of main unchanged
+torch.save({
+    'epoch':           epoch + 1,
+    'model_state':     model.state_dict(),   # ← key is 'model_state'
+    'optimizer_state': optimizer.state_dict(),
+    ...
+}, checkpoint_path)
 ```
 
-Add the function to `app.py`:
+`inference.py` tries `model_state_dict`, `state_dict`, then falls through to a raw dict check — it **never checks `model_state`**. The PR correctly added `"model_state"` to the key list. Verify it's in the right place.
+
+### Verify `modules/detection/inference.py`
+
+The `load_model` function's state dict extraction block must look exactly like this:
 
 ```python
-def _check_network_binding() -> None:
-    """
-    SRS SEC-5: warn if dashboard is accessible on a non-localhost interface.
-    Streamlit exposes server address via its config at runtime.
-    """
-    try:
-        from streamlit import runtime
-        ctx = runtime.get_instance()
-        if ctx is None:
-            return
-        # Check environment variable that Streamlit sets
-        import os
-        server_addr = os.environ.get('STREAMLIT_SERVER_ADDRESS', '127.0.0.1')
-        if server_addr not in ('localhost', '127.0.0.1', '::1'):
-            st.warning(
-                "⚠️ **Security Notice (SRS SEC-5):** "
-                "This dashboard is accessible on a non-localhost network interface "
-                f"(`{server_addr}`). "
-                "MalTwin is a research prototype and is not hardened for external exposure. "
-                "Ensure your network environment is trusted before proceeding.",
-                icon="🔒",
+    raw = torch.load(str(model_path), map_location=device, weights_only=True)
+
+    # ── Extract state_dict regardless of how it was saved ──────────────────
+    if isinstance(raw, dict) and not _looks_like_state_dict(raw):
+        # Full checkpoint dict — try all known key names
+        state_dict = None
+        for key in ("model_state_dict", "state_dict", "model", "model_state"):
+            if key in raw:
+                state_dict = raw[key]
+                break
+        if state_dict is None:
+            raise ValueError(
+                f"Cannot find model weights in checkpoint at {model_path}. "
+                f"Keys found: {list(raw.keys())}. "
+                "Expected one of: model_state_dict, state_dict, model, model_state."
             )
-    except Exception:
-        pass   # non-critical — never block startup
+    else:
+        state_dict = raw
 ```
 
----
-
-### Fix 3: USE-3 error message format in `detection.py`
-
-SRS USE-3 requires all error messages to include: (a) what went wrong, (b) the cause, (c) a suggested action. Scan `detection.py` for any `st.error()` calls that do not follow this format and update them.
-
-The pattern to follow (already used in `upload.py`):
-```
-"Error: [what went wrong]. Cause: [why]. Action: [what to do]."
-```
-
-Specifically, verify `_run_detection()` error message matches this format — it should already from Phase 6, but double-check.
-
----
-
-### Fix 4: `home.py` model accuracy from `eval_metrics.json`
-
-The `get_detection_stats()` function in `db.py` already reads `eval_metrics.json` for accuracy — verify this is wired correctly into the KPI card on the home page. The `model_accuracy` key should be displayed as a percentage. If `get_detection_stats()` returns `None` for accuracy, the KPI card should show `"N/A"` (not crash). This was already implemented in Phase 6 — just verify it works end-to-end.
-
----
-
-### Fix 5: Verify MITRE JSON keys match class names exactly
-
-Run this verification script to catch any key mismatches before the FYP demo:
+### Add the `_looks_like_state_dict` helper if it does not exist
 
 ```python
-# run from repo root: python verify_mitre.py
-import json
-from pathlib import Path
+def _looks_like_state_dict(d: dict) -> bool:
+    """
+    Heuristic: a raw state_dict has tensor values.
+    A checkpoint dict has mixed types (int epoch, dict optimizer_state, etc.).
+    Returns True if d looks like a state dict (all or mostly tensor values).
+    """
+    import torch
+    if not d:
+        return False
+    values = list(d.values())
+    tensor_count = sum(1 for v in values if isinstance(v, torch.Tensor))
+    return tensor_count / len(values) >= 0.8
+```
 
-mitre_path  = Path('data/mitre_ics_mapping.json')
-names_path  = Path('data/processed/class_names.json')
+### Add a test to `tests/test_model.py`
 
-mitre_db = json.loads(mitre_path.read_text())
+Add this to `TestLoadModel`:
 
-if names_path.exists():
-    class_names = json.loads(names_path.read_text())['class_names']
-    print(f"Class names from training: {len(class_names)}")
-    missing_in_mitre = [n for n in class_names if n not in mitre_db]
-    extra_in_mitre   = [k for k in mitre_db if k not in class_names]
-    if missing_in_mitre:
-        print(f"MISSING from MITRE JSON: {missing_in_mitre}")
-    if extra_in_mitre:
-        print(f"EXTRA in MITRE JSON (not in class_names): {extra_in_mitre}")
-    if not missing_in_mitre and not extra_in_mitre:
-        print("✅ All 25 class names match MITRE JSON keys exactly.")
-else:
-    print("class_names.json not found — run scripts/train.py first.")
-    print(f"MITRE JSON has {len(mitre_db)} families.")
+```python
+    def test_loads_from_full_checkpoint_dict_model_state_key(self, tmp_path, num_classes):
+        """
+        Simulate exactly what trainer.py saves: a checkpoint dict with key 'model_state'.
+        This is the format saved to CHECKPOINT_DIR per epoch.
+        inference.py must handle it correctly.
+        """
+        from modules.detection.inference import load_model
+        model = MalTwinCNN(num_classes=num_classes)
+        pt_path = tmp_path / "epoch_001_acc0.8500.pt"
+        # Save exactly as trainer.py does
+        torch.save({
+            'epoch':           1,
+            'model_state':     model.state_dict(),   # ← the key that was missing
+            'optimizer_state': {'state': {}, 'param_groups': []},
+            'val_acc':         0.85,
+            'val_loss':        0.42,
+            'train_acc':       0.87,
+            'train_loss':      0.39,
+        }, pt_path)
+
+        loaded = load_model(model_path=pt_path, num_classes=num_classes, device=torch.device('cpu'))
+        assert isinstance(loaded, MalTwinCNN)
+        assert not loaded.training   # must be in eval mode
+
+        # Weights must match
+        orig_w   = model.block1.conv1.weight.data
+        loaded_w = loaded.block1.conv1.weight.data
+        torch.testing.assert_close(orig_w, loaded_w)
+
+    def test_load_model_raises_helpful_error_for_unknown_checkpoint_keys(self, tmp_path, num_classes):
+        """
+        A checkpoint dict with none of the known keys should raise ValueError
+        with a message that lists the keys found — not a generic KeyError.
+        """
+        from modules.detection.inference import load_model
+        pt_path = tmp_path / "weird_checkpoint.pt"
+        torch.save({'some_unknown_key': 'garbage', 'epoch': 42}, pt_path)
+
+        with pytest.raises(ValueError, match="Cannot find model weights"):
+            load_model(model_path=pt_path, num_classes=num_classes, device=torch.device('cpu'))
 ```
 
 ---
 
-## Part B — `tests/test_integration.py`
+## Fix 3 — Report generation logging (UC-03 postcondition)
 
-This file contains end-to-end smoke tests. Unlike unit tests, these test complete pipelines. They are all marked `@pytest.mark.integration` — they require the Malimg dataset and a trained model. They are skipped automatically in CI.
+### The problem
+
+SRS UC-03 postcondition: *"Report generation event is logged with timestamp."*
+
+No report generation logging exists. Only detection events are logged. This is a genuine gap — the audit correctly identified it.
+
+### Add `log_report_event()` to `modules/dashboard/db.py`
+
+Add this function after `log_detection_event()`:
 
 ```python
-"""
-End-to-end integration smoke tests for the full MalTwin pipeline.
-
-These tests require:
-    - Malimg dataset at config.DATA_DIR
-    - Trained model at config.BEST_MODEL_PATH
-    - data/mitre_ics_mapping.json with 25 families
-
-Run with dataset + model:
-    pytest tests/test_integration.py -v
-
-Skip in CI (no dataset):
-    pytest tests/ -v -m "not integration"
-"""
-import json
-import pytest
-import numpy as np
-import torch
-from pathlib import Path
-
-import config
-
-
-# ── Skip guard ────────────────────────────────────────────────────────────────
-
-def _dataset_available() -> bool:
-    return (
-        config.DATA_DIR.exists()
-        and any(config.DATA_DIR.iterdir())
-    )
-
-
-def _model_available() -> bool:
-    return (
-        config.BEST_MODEL_PATH.exists()
-        and config.CLASS_NAMES_PATH.exists()
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Pipeline: Binary → Image → Detection → GradCAM → Report
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestFullPipeline:
+def log_report_event(
+    db_path: Path,
+    detection_event_id: int | None,
+    sha256: str,
+    report_format: str,
+    gradcam_included: bool,
+) -> None:
     """
-    Tests the complete ML pipeline from raw binary bytes to forensic report.
-    Uses the Phase 1 test fixture (sample_pe.exe) as input binary.
+    Log a forensic report generation event. UC-03 postcondition.
+    Never raises — a DB failure must not block the download.
+
+    Args:
+        detection_event_id: id of the detection_events row (None if unknown).
+        sha256:             SHA-256 of the analyzed binary.
+        report_format:      'PDF' or 'JSON'.
+        gradcam_included:   True if Grad-CAM heatmap was embedded.
     """
+    # Ensure the report_events table exists first
+    _ensure_report_table(db_path)
 
-    @pytest.fixture
-    def sample_pe_bytes(self):
-        """Load the Phase 1 test fixture PE binary."""
-        fixture = Path('tests/fixtures/sample_pe.exe')
-        if not fixture.exists():
-            pytest.skip("tests/fixtures/sample_pe.exe not found")
-        return fixture.read_bytes()
+    timestamp = datetime.utcnow().isoformat()
+    sql = """
+        INSERT INTO report_events
+            (timestamp, detection_event_id, sha256, report_format, gradcam_included)
+        VALUES (?, ?, ?, ?, ?)
+    """
+    params = (
+        timestamp,
+        detection_event_id,
+        sha256,
+        report_format,
+        1 if gradcam_included else 0,
+    )
+    for attempt in range(2):
+        try:
+            with get_connection(db_path) as conn:
+                conn.execute(sql, params)
+            return
+        except Exception as e:
+            if attempt == 0:
+                time.sleep(0.1)
+            else:
+                print(f"[MalTwin] Report log write failed: {e}", file=sys.stderr)
 
-    @pytest.mark.integration
-    def test_binary_to_image_pipeline(self, sample_pe_bytes):
-        """Phase 1+2: binary bytes → 128×128 uint8 numpy array."""
-        from modules.binary_to_image.converter import BinaryConverter
-        from modules.binary_to_image.utils import validate_binary_format, compute_sha256
 
-        fmt = validate_binary_format(sample_pe_bytes)
-        assert fmt == 'PE'
+def _ensure_report_table(db_path: Path) -> None:
+    """Create report_events table if it does not exist. Idempotent."""
+    try:
+        with get_connection(db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS report_events (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp           TEXT    NOT NULL,
+                    detection_event_id  INTEGER,
+                    sha256              TEXT    NOT NULL,
+                    report_format       TEXT    NOT NULL,
+                    gradcam_included    INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_report_sha256 "
+                "ON report_events(sha256)"
+            )
+    except Exception as e:
+        print(f"[MalTwin] Failed to create report_events table: {e}", file=sys.stderr)
+```
 
-        sha = compute_sha256(sample_pe_bytes)
-        assert len(sha) == 64
+### Call `log_report_event()` from `detection.py`
 
-        converter = BinaryConverter(img_size=config.IMG_SIZE)
-        img = converter.convert(sample_pe_bytes)
-        assert img.shape == (config.IMG_SIZE, config.IMG_SIZE)
-        assert img.dtype == np.uint8
+In the `col_pdf` block in `_render_results()`, after `pdf_bytes` is confirmed non-None and before rendering `st.download_button`, add:
 
-    @pytest.mark.integration
-    def test_dataset_loads_correctly(self):
-        """Phase 3+4: MalimgDataset loads and returns correct tensor shapes."""
-        if not _dataset_available():
-            pytest.skip("Malimg dataset not available")
+```python
+                # Log report generation (UC-03 postcondition)
+                from modules.dashboard.db import log_report_event
+                log_report_event(
+                    config.DB_PATH,
+                    detection_event_id=None,   # not tracked in session state
+                    sha256=report_data['sha256'],
+                    report_format='PDF',
+                    gradcam_included=report_data['gradcam'].get('generated', False),
+                )
+```
 
-        from modules.dataset.loader import MalimgDataset
-        ds = MalimgDataset(config.DATA_DIR, 'train', img_size=config.IMG_SIZE)
+In the `col_json` block, wrap the `generate_json_report` call and add logging:
 
-        assert len(ds) > 0
-        assert len(ds.class_names) == 25
-
-        tensor, label = ds[0]
-        assert tensor.shape == (1, config.IMG_SIZE, config.IMG_SIZE)
-        assert tensor.dtype == torch.float32
-        assert isinstance(label, int)
-        assert 0 <= label < 25
-
-    @pytest.mark.integration
-    def test_all_25_classes_in_train_split(self):
-        """Stratified split must preserve all 25 classes in train split."""
-        if not _dataset_available():
-            pytest.skip("Malimg dataset not available")
-
-        from modules.dataset.loader import MalimgDataset
-        ds = MalimgDataset(config.DATA_DIR, 'train')
-        assert len(set(ds.get_labels())) == 25
-
-    @pytest.mark.integration
-    def test_model_inference_pipeline(self, sample_pe_bytes):
-        """Phase 4+5: binary → image → model inference → prediction dict."""
-        if not _model_available():
-            pytest.skip("Trained model not available")
-
-        from modules.binary_to_image.converter import BinaryConverter
-        from modules.dataset.preprocessor import load_class_names
-        from modules.detection.inference import load_model, predict_single
-
-        # Binary → image
-        img = BinaryConverter(config.IMG_SIZE).convert(sample_pe_bytes)
-        assert img.shape == (config.IMG_SIZE, config.IMG_SIZE)
-
-        # Load model
-        class_names = load_class_names(config.CLASS_NAMES_PATH)
-        model = load_model(config.BEST_MODEL_PATH, len(class_names), config.DEVICE)
-        assert model is not None
-
-        # Inference
-        result = predict_single(model, img, class_names, config.DEVICE)
-        assert result['predicted_family'] in class_names
-        assert 0.0 <= result['confidence'] <= 1.0
-        assert len(result['top3']) == 3
-        assert abs(sum(result['probabilities'].values()) - 1.0) < 1e-4
-
-    @pytest.mark.integration
-    def test_gradcam_pipeline(self, sample_pe_bytes):
-        """Step 1: binary → image → GradCAM heatmap."""
-        if not _model_available():
-            pytest.skip("Trained model not available")
-
-        from modules.binary_to_image.converter import BinaryConverter
-        from modules.dataset.preprocessor import load_class_names
-        from modules.detection.inference import load_model, predict_single
-        from modules.detection.gradcam import generate_gradcam
-
-        img         = BinaryConverter(config.IMG_SIZE).convert(sample_pe_bytes)
-        class_names = load_class_names(config.CLASS_NAMES_PATH)
-        model       = load_model(config.BEST_MODEL_PATH, len(class_names), config.DEVICE)
-        result      = predict_single(model, img, class_names, config.DEVICE)
-        target_cls  = class_names.index(result['predicted_family'])
-
-        heatmap = generate_gradcam(model, img, target_cls, config.DEVICE)
-        assert heatmap is not None
-        assert heatmap['heatmap_array'].shape == (config.IMG_SIZE, config.IMG_SIZE)
-        assert heatmap['heatmap_array'].min() >= 0.0
-        assert heatmap['heatmap_array'].max() <= 1.0
-        assert isinstance(heatmap['overlay_png'], bytes)
-        assert len(heatmap['overlay_png']) > 0
-
-    @pytest.mark.integration
-    def test_json_report_pipeline(self, sample_pe_bytes):
-        """Step 2: full detection → JSON report with MITRE mapping."""
-        if not _model_available():
-            pytest.skip("Trained model not available")
-
-        from modules.binary_to_image.converter import BinaryConverter
-        from modules.binary_to_image.utils import validate_binary_format, compute_sha256
-        from modules.dataset.preprocessor import load_class_names
-        from modules.detection.inference import load_model, predict_single
+```python
         from modules.reporting.json_report import generate_json_report
-        from modules.reporting.mitre_mapper import get_mitre_mapping
-
-        img         = BinaryConverter(config.IMG_SIZE).convert(sample_pe_bytes)
-        file_format = validate_binary_format(sample_pe_bytes)
-        sha256      = compute_sha256(sample_pe_bytes)
-        class_names = load_class_names(config.CLASS_NAMES_PATH)
-        model       = load_model(config.BEST_MODEL_PATH, len(class_names), config.DEVICE)
-        result      = predict_single(model, img, class_names, config.DEVICE)
-        mitre       = get_mitre_mapping(result['predicted_family'])
-
-        report_data = {
-            'file_name':        'sample_pe.exe',
-            'sha256':           sha256,
-            'file_format':      file_format,
-            'file_size_bytes':  len(sample_pe_bytes),
-            'upload_time':      '2025-05-01T12:00:00',
-            'predicted_family': result['predicted_family'],
-            'confidence':       result['confidence'],
-            'top3':             result['top3'],
-            'all_probabilities':result['probabilities'],
-            'gradcam':          {'generated': False},
-            'mitre':            mitre,
-        }
-
+        from modules.dashboard.db import log_report_event
         json_bytes = generate_json_report(report_data)
-        assert isinstance(json_bytes, bytes)
-        parsed = json.loads(json_bytes)
-
-        assert parsed['file_information']['sha256'] == sha256
-        assert parsed['detection_result']['predicted_family'] == result['predicted_family']
-        assert 'mitre_attack_ics' in parsed
-        assert 'explainability' in parsed
-
-    @pytest.mark.integration
-    def test_pdf_report_pipeline(self, sample_pe_bytes):
-        """Step 2: full detection → PDF report with valid PDF header."""
-        if not _model_available():
-            pytest.skip("Trained model not available")
-
-        from modules.reporting.pdf_report import generate_pdf_report, FPDF2_AVAILABLE
-        if not FPDF2_AVAILABLE:
-            pytest.skip("fpdf2 not installed")
-
-        from modules.binary_to_image.converter import BinaryConverter
-        from modules.binary_to_image.utils import validate_binary_format, compute_sha256
-        from modules.dataset.preprocessor import load_class_names
-        from modules.detection.inference import load_model, predict_single
-        from modules.reporting.mitre_mapper import get_mitre_mapping
-
-        img         = BinaryConverter(config.IMG_SIZE).convert(sample_pe_bytes)
-        class_names = load_class_names(config.CLASS_NAMES_PATH)
-        model       = load_model(config.BEST_MODEL_PATH, len(class_names), config.DEVICE)
-        result      = predict_single(model, img, class_names, config.DEVICE)
-
-        report_data = {
-            'file_name':        'sample_pe.exe',
-            'sha256':           compute_sha256(sample_pe_bytes),
-            'file_format':      validate_binary_format(sample_pe_bytes),
-            'file_size_bytes':  len(sample_pe_bytes),
-            'upload_time':      '2025-05-01T12:00:00',
-            'predicted_family': result['predicted_family'],
-            'confidence':       result['confidence'],
-            'top3':             result['top3'],
-            'all_probabilities':result['probabilities'],
-            'gradcam':          {'generated': False},
-            'mitre':            get_mitre_mapping(result['predicted_family']),
-        }
-
-        pdf_bytes = generate_pdf_report(report_data)
-        assert pdf_bytes is not None
-        assert pdf_bytes[:4] == b'%PDF'
-        assert len(pdf_bytes) > 5000
-
-    @pytest.mark.integration
-    def test_detection_event_logged_to_db(self, tmp_path, sample_pe_bytes):
-        """Step 2+Phase6: detection event persists to SQLite."""
-        if not _model_available():
-            pytest.skip("Trained model not available")
-
-        from modules.binary_to_image.converter import BinaryConverter
-        from modules.binary_to_image.utils import compute_sha256
-        from modules.dataset.preprocessor import load_class_names
-        from modules.detection.inference import load_model, predict_single
-        from modules.dashboard.db import init_db, log_detection_event, get_recent_events
-
-        db_path = tmp_path / "integration_test.db"
-        init_db(db_path)
-
-        img         = BinaryConverter(config.IMG_SIZE).convert(sample_pe_bytes)
-        class_names = load_class_names(config.CLASS_NAMES_PATH)
-        model       = load_model(config.BEST_MODEL_PATH, len(class_names), config.DEVICE)
-        result      = predict_single(model, img, class_names, config.DEVICE)
-
-        log_detection_event(
-            db_path,
-            file_name='sample_pe.exe',
-            sha256=compute_sha256(sample_pe_bytes),
-            file_format='PE',
-            file_size=len(sample_pe_bytes),
-            predicted_family=result['predicted_family'],
-            confidence=result['confidence'],
-            device_used=str(config.DEVICE),
+        # Log JSON report generation (UC-03 postcondition)
+        log_report_event(
+            config.DB_PATH,
+            detection_event_id=None,
+            sha256=report_data['sha256'],
+            report_format='JSON',
+            gradcam_included=report_data['gradcam'].get('generated', False),
         )
+```
 
-        events = get_recent_events(db_path, limit=5)
-        assert len(events) == 1
-        assert events[0]['predicted_family'] == result['predicted_family']
-        assert events[0]['file_name'] == 'sample_pe.exe'
+### Add tests to `tests/test_db.py`
 
-    @pytest.mark.integration
-    def test_mitre_coverage_for_trained_classes(self):
-        """All class names from training must have MITRE mappings."""
-        if not _model_available():
-            pytest.skip("Trained model not available")
+```python
+class TestLogReportEvent:
+    def test_does_not_raise(self, temp_db):
+        from modules.dashboard.db import log_report_event
+        log_report_event(temp_db, None, 'a' * 64, 'PDF', False)
 
-        from modules.dataset.preprocessor import load_class_names
-        from modules.reporting.mitre_mapper import load_mitre_db
+    def test_creates_report_events_table(self, temp_db):
+        from modules.dashboard.db import log_report_event, get_connection
+        log_report_event(temp_db, None, 'a' * 64, 'JSON', True)
+        with get_connection(temp_db) as conn:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='report_events'"
+            ).fetchall()
+        assert len(rows) == 1
 
-        class_names = load_class_names(config.CLASS_NAMES_PATH)
-        mitre_db    = load_mitre_db()
+    def test_inserted_values_correct(self, temp_db):
+        from modules.dashboard.db import log_report_event, get_connection
+        log_report_event(temp_db, 42, 'b' * 64, 'PDF', True)
+        with get_connection(temp_db) as conn:
+            row = conn.execute("SELECT * FROM report_events").fetchone()
+        assert dict(row)['sha256'] == 'b' * 64
+        assert dict(row)['report_format'] == 'PDF'
+        assert dict(row)['gradcam_included'] == 1
 
-        missing = [n for n in class_names if n not in mitre_db]
-        assert not missing, (
-            f"The following trained classes have no MITRE mapping: {missing}\n"
-            "Update data/mitre_ics_mapping.json to add them."
-        )
+    def test_does_not_raise_on_missing_db(self, tmp_path):
+        from modules.dashboard.db import log_report_event
+        bad_path = tmp_path / "nonexistent_dir" / "db.db"
+        log_report_event(bad_path, None, 'a' * 64, 'JSON', False)
 ```
 
 ---
 
-## Part C — `SRS_COMPLIANCE.md`
+## Fix 4 — FR1.1 refresh rate disclosure
 
-Create this file at the repo root. Hand it to your supervisor as evidence of requirements coverage.
+### The problem
 
-```markdown
-# MalTwin — SRS Compliance Matrix
-**Project:** MalTwin — IIoT Malware Detection Framework  
-**Authors:** Iman Fatima (CIIT/SP23-BCT-021/ISB), Maaz Malik (CIIT/SP23-BCT-025/ISB)  
-**Supervisor:** Ms. Najla Raza  
-**Institution:** COMSATS University Islamabad | BS Cyber Security 2023-2027  
-**SRS Version:** 1.0 | **Implementation Version:** 1.0
+SRS FR1.1 business rule: *"Status indicators shall refresh automatically every 5 seconds."*  
+Implementation: `@st.cache_data(ttl=30)` — 30 seconds, not 5.
 
----
+A true 5-second TTL causes excessive filesystem checks during normal dashboard use. The 30-second TTL is the correct engineering choice. The gap to close is **disclosure** — update `SRS_COMPLIANCE.md` and the home page caption to be explicit.
 
-## Functional Requirements
+### Update `home.py` caption
 
-### Mockup M1 — Main Dashboard Screen
+In `_render_module_status()`, replace:
+```python
+    st.caption("Status refreshes every 30 seconds automatically.")
+```
+With:
+```python
+    st.caption(
+        "Status refreshes every 30 seconds automatically. "
+        "(SRS FR1.1 specifies 5s; 30s is used to avoid excessive filesystem I/O — "
+        "functionally equivalent for research use.)"
+    )
+```
 
-| FR-ID | Requirement | Implementation | Status |
-|-------|-------------|----------------|--------|
-| FR1.1 | Display operational status of all 8 modules | `modules/dashboard/health.py` → `get_all_module_statuses()` cached 30s; styled table in `home.py` `_render_module_status()` | ✅ Implemented |
-| FR1.2 | Display cumulative detection statistics | `db.py` `get_detection_stats()` reads SQLite + `eval_metrics.json`; rendered as `st.metric` in `home.py` | ✅ Implemented |
-| FR1.3 | Persistent sidebar navigation | `app.py` `render_sidebar()` — 6-page radio nav; ⚠️ suffix on unavailable pages | ✅ Implemented |
-| FR1.4 | Scrollable feed of 5 most recent detections | `home.py` `_render_history_section()` — filterable table with sort, family, confidence, date range, CSV export | ✅ Implemented (exceeds spec) |
+### Update `SRS_COMPLIANCE.md`
 
-### Mockup M2 — Digital Twin Monitor Screen
+In the FR1.1 row, change the Status column from `✅ Implemented` to `✅ Implemented*` and add a footnote at the bottom of the table:
 
-| FR-ID | Requirement | Implementation | Status |
-|-------|-------------|----------------|--------|
-| FR2.1 | Start/Stop simulation via dashboard | `digital_twin.py` stub page; Docker check in `health.py` `_check_module1_digital_twin()` | ⚠️ Deferred (M1 future sprint) |
-| FR2.2 | Live traffic log | Planned for Digital Twin sprint | ⚠️ Deferred |
-| FR2.3 | Node status panel | Planned for Digital Twin sprint | ⚠️ Deferred |
-| FR2.4 | Protocol traffic pie chart | Planned for Digital Twin sprint | ⚠️ Deferred |
-
-### Mockup M3 — Binary Upload and Visualization Screen
-
-| FR-ID | Requirement | Implementation | Status |
-|-------|-------------|----------------|--------|
-| FR3.1 | Binary file upload (PE/ELF, max 50 MB) | `upload.py` `st.file_uploader()` with size + format validation | ✅ Implemented |
-| FR3.2 | Grayscale image display within 3 seconds | `upload.py` `_process_upload()` → `BinaryConverter` → `st.image()` | ✅ Implemented |
-| FR3.3 | File metadata display (name, size, format, SHA-256) | `upload.py` `_render_results()` metadata table + monospace SHA-256 | ✅ Implemented |
-| FR3.4 | Pixel intensity histogram (256 bins) | `upload.py` `_render_results()` Plotly bar chart via `compute_pixel_histogram()` | ✅ Implemented |
-
-### Mockup M5 — Malware Detection and Prediction Screen
-
-| FR-ID | Requirement | Implementation | Status |
-|-------|-------------|----------------|--------|
-| FR5.1 | Run detection on uploaded image | `detection.py` `_run_detection()` via `predict_single()` | ✅ Implemented |
-| FR5.2 | Top-1 label + colour-coded confidence bar | `detection.py` `_render_results()` — green ≥80%, amber 50–79%, red <50% | ✅ Implemented |
-| FR5.3 | Per-class probability chart (all 25 classes) | `detection.py` `_render_probability_chart()` horizontal Plotly bar chart | ✅ Implemented |
-| FR5.4 | Grad-CAM XAI heatmap toggle | `detection.py` checkbox → `_run_gradcam()` → `generate_gradcam()` via Captum | ✅ Implemented (Step 1) |
-| FR5.5 | MITRE ATT&CK for ICS mapping | `detection.py` `_render_mitre_mapping()` reads `mitre_ics_mapping.json` | ✅ Implemented |
-| FR5.6 | PDF + JSON forensic report download | `detection.py` → `pdf_report.py` + `json_report.py` via FPDF2 | ✅ Implemented (Step 2) |
-
-### Backend Process Requirements (Event-Response Table)
-
-| FR-ID | Event | Implementation | Status |
-|-------|-------|----------------|--------|
-| FR-B1 | Binary uploaded | `upload.py` → `validate_binary_format()` → `BinaryConverter` → `compute_sha256()` | ✅ Implemented |
-| FR-B2 | Detection run requested | `detection.py` → `predict_single()` → softmax probabilities | ✅ Implemented |
-| FR-B3 | Detection result available → DB log | `detection.py` `_run_detection()` → `log_detection_event()` non-blocking retry | ✅ Implemented |
-| FR-B4 | Forensic report requested | `detection.py` → `generate_pdf_report()` / `generate_json_report()` + MITRE query | ✅ Implemented (Step 2) |
-| FR-B5 | Digital Twin start requested | Deferred — Docker/Mininet not yet deployed | ⚠️ Deferred |
-| FR-B6 | Grad-CAM heatmap requested | `detection.py` → `generate_gradcam()` via Captum `LayerGradCam` | ✅ Implemented (Step 1) |
-
----
-
-## Non-Functional Requirements
-
-### Reliability
-
-| NFR-ID | Requirement | Implementation | Status |
-|--------|-------------|----------------|--------|
-| REL-1 | Identical results across 10 runs (variance < 0.5%) | `model.eval()` + `torch.no_grad()` in `predict_single()`; no Dropout at inference | ✅ Met |
-| REL-2 | Corrupt files handled without crash | `upload.py` wraps all parsing in try/except with USE-3 format error messages | ✅ Met |
-| REL-3 | Digital Twin MTBF ≥ 4 hours | Deferred with M1 | ⚠️ Deferred |
-| REL-4 | SQLite WAL mode — no records lost on unclean shutdown | `db.py` `get_connection()` sets `PRAGMA journal_mode=WAL` on every connection | ✅ Met |
-| REL-5 | Handle 2 concurrent sessions without collision | Streamlit session isolation via `st.session_state` — each session has independent state | ✅ Met |
-
-### Usability
-
-| NFR-ID | Requirement | Implementation | Status |
-|--------|-------------|----------------|--------|
-| USE-1 | First-time user completes upload + detection in < 5 minutes | 4-step sidebar flow with inline instructions on each page | ✅ Met |
-| USE-2 | Visual indicators interpretable without ML background | Colour-coded confidence bar, emoji status, labelled MITRE table | ✅ Met |
-| USE-3 | All errors: what + cause + action | All `st.error()` calls follow "Error: X. Cause: Y. Action: Z." format | ✅ Met |
-| USE-4 | Tooltips on technical terms | `help=` parameter on all technical widgets (confidence, Grad-CAM, MITRE) | ✅ Met |
-| USE-5 | Report download < 10 seconds, opens in standard viewers | FPDF2 PDF + Python `json.dumps()` — tested locally | ✅ Met |
-
-### Performance
-
-| NFR-ID | Requirement | Implementation | Status |
-|--------|-------------|----------------|--------|
-| PER-1 | Conversion < 3s for ≤10 MB, < 10s for ≤50 MB | `BinaryConverter` uses numpy reshape + cv2 resize — sub-second for typical files | ✅ Met |
-| PER-2 | Inference < 5s CPU, < 1s GPU | `predict_single()` — single forward pass on (1,1,128,128); CPU: ~0.2s typical | ✅ Met |
-| PER-3 | Dashboard renders within 4s on local network | Streamlit default — satisfied on localhost | ✅ Met |
-| PER-4 | Grad-CAM < 8s CPU, < 3s GPU | Captum `LayerGradCam` — single backward pass; CPU: ~1–3s typical | ✅ Met |
-| PER-5 | Report generation < 10s | FPDF2 PDF ~1–2s; JSON ~0.01s | ✅ Met |
-| PER-6 | DB supports 100k records, query < 500ms | SQLite with `idx_timestamp` + `idx_family` indexes; WAL mode | ✅ Met |
-
-### Security
-
-| NFR-ID | Requirement | Implementation | Status |
-|--------|-------------|----------------|--------|
-| SEC-1 | Uploaded files processed in Docker only | Files processed in Python session memory only; no host filesystem write | ✅ Met (research scope) |
-| SEC-2 | Digital Twin network isolated | Planned for M1 sprint with `--internal` Docker bridge network | ⚠️ Deferred |
-| SEC-3 | SQLite file permissions 600 | `db.py` `init_db()` calls `os.chmod(db_path, 0o600)` after creation | ✅ Met |
-| SEC-4 | SHA-256 computed locally via hashlib | `utils.py` `compute_sha256()` uses `hashlib.sha256()` — no external calls | ✅ Met |
-| SEC-5 | Dashboard bound to localhost by default | `app.py` `_check_network_binding()` warns on non-localhost binding | ✅ Implemented (Step 6) |
-
----
-
-## Use Cases
-
-| UC-ID | Use Case | Implementation | Status |
-|-------|----------|----------------|--------|
-| UC-01 | Upload Binary File and Convert | `upload.py` full flow — validate → convert → display → store in state | ✅ Implemented |
-| UC-02 | Run Malware Detection and View Prediction | `detection.py` full flow — guard → run → display → log | ✅ Implemented |
-| UC-03 | Generate and Download Forensic Report | `detection.py` → `pdf_report.py` + `json_report.py` → `st.download_button` | ✅ Implemented |
-| UC-04 | Simulate IIoT Environment via Digital Twin | `digital_twin.py` stub — full implementation deferred | ⚠️ Deferred |
-| UC-05 | Train Detection Model | `training.py` → `training_manager.py` → `scripts/train.py` subprocess | ✅ Implemented (Step 5) |
-
----
-
-## Business Objectives
-
-| BO-ID | Objective | Implementation | Status |
-|-------|-----------|----------------|--------|
-| BO-1 | Digital Twin IIoT simulation | `digital_twin.py` stub; Docker check in health.py | ⚠️ Deferred |
-| BO-2 | Binary-to-image conversion pipeline | `modules/binary_to_image/` — PE/ELF → 128×128 grayscale | ✅ Implemented |
-| BO-3 | Data enhancement + class balancing | `modules/enhancement/` — augmentation + `ClassAwareOversampler` | ✅ Implemented |
-| BO-4 | CNN malware classification | `MalTwinCNN` — 3-block CNN, 25-class, ~3.2M params | ✅ Implemented |
-| BO-5 | Evaluation metrics (acc/prec/rec/F1/CM) | `evaluator.py` `evaluate()` + `format_metrics_table()` + confusion matrix PNG | ✅ Implemented |
-| BO-6 | Grad-CAM XAI | `gradcam.py` via Captum `LayerGradCam`, jet overlay, heatmap export | ✅ Implemented |
-| BO-7 | Interactive Streamlit dashboard | 6-page dashboard with training, gallery, history, XAI, reporting | ✅ Implemented |
-| BO-8 | Automated forensic reporting (PDF + JSON + MITRE) | `modules/reporting/` — FPDF2 PDF, structured JSON, 25-family MITRE DB | ✅ Implemented |
-
----
-
-## Module Feature Coverage
-
-| Module | Feature | SRS FE-ID | Status |
-|--------|---------|-----------|--------|
-| M2 | Accept PE/ELF, validate header | FE-1 | ✅ |
-| M2 | Read bytes, reshape to 2D array | FE-2 | ✅ |
-| M2 | Render 128×128 grayscale PNG | FE-3 | ✅ |
-| M2 | Compute SHA-256 | FE-4 | ✅ |
-| M3 | Source from Malimg dataset | FE-1 | ✅ (Malimg only; VirusShare/IoT-23 deferred) |
-| M3 | Normalise pixels, encode labels | FE-2 | ✅ |
-| M3 | Stratified train/val/test split | FE-3 | ✅ |
-| M3 | Validate dataset integrity | FE-4 | ✅ |
-| M4 | Rotation, flip, brightness augmentation | FE-1 | ✅ |
-| M4 | Gaussian noise injection | FE-2 | ✅ |
-| M4 | Class-aware oversampling | FE-3 | ✅ |
-| M4 | Dataset gallery visualisation | FE-4 | ✅ (Step 3) |
-| M5 | CNN architecture | FE-1 | ✅ |
-| M5 | Configurable training | FE-2 | ✅ |
-| M5 | Acc/prec/rec/F1/CM evaluation | FE-3 | ✅ |
-| M5 | Per-class probability + top-1 label | FE-4 | ✅ |
-| M5 | PyTorch .pt serialisation | FE-5 | ✅ |
-| M6 | Main dashboard + module status | FE-1 | ✅ |
-| M6 | Binary upload + image display | FE-2 | ✅ |
-| M6 | Detection result + confidence | FE-3 | ✅ |
-| M6 | Grad-CAM heatmap display | FE-4 | ✅ (Step 1) |
-| M6 | Dataset gallery | FE-5 | ✅ (Step 3) |
-| M6 | Digital Twin status | FE-6 | ⚠️ Replaced with system resource stats |
-| M7 | Captum LayerGradCam | FE-1 | ✅ (Step 1) |
-| M7 | Jet colormap overlay on binary image | FE-2 | ✅ (Step 1) |
-| M7 | Textual interpretation annotations | FE-3 | ✅ (Step 1) |
-| M7 | XAI heatmap export | FE-4 | ✅ (Step 1) |
-| M8 | PDF + JSON report generation | FE-1 | ✅ (Step 2) |
-| M8 | Report content (hash, family, conf, heatmap) | FE-2 | ✅ (Step 2) |
-| M8 | MITRE ATT&CK for ICS mapping | FE-3 | ✅ (Step 2) |
-| M8 | SQLite detection event logging | FE-4 | ✅ |
-| M8 | Detection history view with filtering | FE-5 | ✅ (Step 3) |
-
----
-
-## Summary
-
-| Category | Total | Implemented | Deferred | 
-|----------|-------|-------------|----------|
-| Functional Requirements | 18 | 14 | 4 (all M1/Digital Twin) |
-| Non-Functional Requirements | 16 | 14 | 2 (REL-3, SEC-2 — Digital Twin) |
-| Use Cases | 5 | 4 | 1 (UC-04 Digital Twin) |
-| Business Objectives | 8 | 7 | 1 (BO-1 Digital Twin) |
-| Module Features | 30 | 28 | 2 |
-
-**All deferred items are exclusively Digital Twin (M1) related.**  
-The ML pipeline, dashboard, XAI, and reporting are fully implemented.
+```
+*FR1.1 TTL deviation: SRS specifies 5-second refresh. Implementation uses 30-second
+cache TTL (health.py:225) to avoid excessive filesystem polling during normal use.
+Functionally equivalent for research deployment. Would require architectural change
+(websocket or server-sent events) to achieve true 5-second push updates in Streamlit.
 ```
 
 ---
 
-## Part D — Final `pytest` Run
+## Fix 5 — FR1.4 recent detection feed (top 5 baseline)
 
-Run the complete test suite. Every line below should complete with 0 failures.
+### The problem
+
+SRS FR1.4: *"display a scrollable feed of the five most recent detection events."*  
+Current: the filter expander replaces the feed entirely — there's no quick baseline view before opening filters.
+
+### Update `home.py` `render()`
+
+Before the `_render_history_section()` call, add a quick baseline feed that's always visible:
+
+```python
+    # ── Quick recent feed (always visible — SRS FR1.4) ───────────────────────
+    st.subheader("Recent Detections")
+    _render_recent_feed_baseline()
+
+    # ── Full filterable history ───────────────────────────────────────────────
+    with st.expander("📋 Full Detection History (filter & export)", expanded=False):
+        _render_history_section()
+```
+
+Add this new function:
+
+```python
+def _render_recent_feed_baseline() -> None:
+    """
+    Scrollable feed of the 5 most recent detections. SRS FR1.4 baseline.
+    Always visible — no filters, no interaction required.
+    """
+    import pandas as pd
+    events = get_recent_events(config.DB_PATH, limit=5)
+
+    if not events:
+        st.caption("No detections yet. Upload a binary file to get started.")
+        return
+
+    df = pd.DataFrame(events)
+    df['confidence'] = df['confidence'].apply(lambda x: f"{x * 100:.1f}%")
+    df['timestamp']  = pd.to_datetime(df['timestamp']).dt.strftime('%Y-%m-%d %H:%M')
+    display = df[['timestamp', 'file_name', 'predicted_family', 'confidence']].copy()
+    display.columns = ['Timestamp', 'File', 'Predicted Family', 'Confidence']
+    st.dataframe(display, use_container_width=True, hide_index=True)
+```
+
+The full filterable history remains, but now inside an expander so the baseline feed satisfies FR1.4 and the enhanced filtering satisfies M8 FE-5.
+
+---
+
+## Fix 6 — SI-5 deviation: document the `ImageFolder` decision
+
+### The problem
+
+SRS SI-5 specifies using `PyTorch ImageFolder`. The custom `MalimgDataset` is better but diverges from spec. This needs to be documented, not hidden.
+
+### Update `SRS_COMPLIANCE.md`
+
+In the M3 FE-1 row, change status from `✅` to `✅*` and add to footnotes:
+
+```
+*SI-5 deviation: SRS specifies PyTorch ImageFolder for dataset loading.
+Implementation uses a custom MalimgDataset class (modules/dataset/loader.py)
+that provides stratified splitting, class count tracking, and integration
+with WeightedRandomSampler — capabilities ImageFolder does not natively
+support. This is an intentional improvement over the specification.
+```
+
+Also add a docstring to `MalimgDataset.__init__` explaining the decision:
+
+```python
+    """
+    Custom PyTorch Dataset for the Malimg malware image dataset.
+
+    Deviation from SRS SI-5: The SRS specifies PyTorch ImageFolder.
+    This custom class is used instead because it provides:
+      - Stratified train/val/test splitting (ImageFolder has no split support)
+      - Per-split class count tracking (needed by ClassAwareOversampler)
+      - Integration with WeightedRandomSampler for class balancing
+
+    The interface is otherwise Dataset-compatible (len, getitem, get_labels).
+    """
+```
+
+---
+
+## Fix 7 — Benign class surfaced to user (architectural notice)
+
+### The problem
+
+The system classifies every uploaded binary into one of 25 malware families. There is no benign class. A user who uploads a legitimate binary will still receive a malware family prediction — this could be misleading.
+
+### Update `detection.py` `_render_results()`
+
+Add a persistent notice below the detection result banner:
+
+```python
+    # Benign class notice (architectural constraint — SRS_COMPLIANCE.md)
+    st.caption(
+        "ℹ️ MalTwin classifies binaries into known malware families only. "
+        "There is no benign class — every uploaded binary receives a malware family prediction. "
+        "Low confidence scores (<50%) indicate the binary may not match any trained family. "
+        "This is a known architectural constraint of the Malimg-trained model."
+    )
+```
+
+Place this immediately after the confidence bar and before the Top 3 section.
+
+---
+
+## Fix 8 — Model/class_names stale session state
+
+### The problem
+
+If `best_model.pt` is replaced on disk mid-session (e.g. a new training run completes via CLI while the dashboard is open), `session_state[KEY_MODEL]` holds stale weights. Detection runs fine but produces results from the old model.
+
+### Add a staleness check in `app.py` `load_global_resources()`
+
+After the model load block, add:
+
+```python
+def load_global_resources() -> None:
+    # ... existing class names load ...
+
+    # ── Staleness check ─────────────────────────────────────────────────────
+    # If model is loaded but the file on disk has a newer mtime,
+    # reset and reload. Handles CLI training completing mid-session.
+    if st.session_state[state.KEY_MODEL_LOADED]:
+        try:
+            stored_mtime = st.session_state.get('_model_mtime', 0)
+            current_mtime = config.BEST_MODEL_PATH.stat().st_mtime
+            if current_mtime > stored_mtime + 1:   # +1s tolerance
+                # Model file changed — reset and reload
+                st.session_state[state.KEY_MODEL]        = None
+                st.session_state[state.KEY_MODEL_LOADED] = False
+                st.session_state['_model_mtime']         = 0
+        except Exception:
+            pass
+
+    # ── Model load ──────────────────────────────────────────────────────────
+    if (
+        st.session_state[state.KEY_MODEL] is None
+        and st.session_state[state.KEY_CLASS_NAMES] is not None
+    ):
+        try:
+            with st.spinner("Loading detection model…"):
+                num_classes = len(st.session_state[state.KEY_CLASS_NAMES])
+                model = load_model(config.BEST_MODEL_PATH, num_classes, config.DEVICE)
+                st.session_state[state.KEY_MODEL]        = model
+                st.session_state[state.KEY_MODEL_LOADED] = True
+                st.session_state[state.KEY_DEVICE_INFO]  = str(config.DEVICE)
+                st.session_state['_model_mtime']         = config.BEST_MODEL_PATH.stat().st_mtime
+        except FileNotFoundError:
+            st.session_state[state.KEY_MODEL_LOADED] = False
+```
+
+---
+
+## Definition of Done
 
 ```bash
-# ── 1. Full unit test suite ───────────────────────────────────────────────────
-pytest tests/ -v -m "not integration" --tb=short
+# Run the new/updated tests
+pytest tests/test_model.py::TestLoadModel::test_loads_from_full_checkpoint_dict_model_state_key -v
+pytest tests/test_model.py::TestLoadModel::test_load_model_raises_helpful_error_for_unknown_checkpoint_keys -v
+pytest tests/test_db.py::TestLogReportEvent -v
 
-# Expected files and approximate test counts:
-# tests/test_converter.py        ~20 tests   ✅
-# tests/test_dataset.py          ~30 tests   ✅ (unit only)
-# tests/test_enhancement.py      ~15 tests   ✅
-# tests/test_model.py            ~40 tests   ✅
-# tests/test_db.py               ~35 tests   ✅
-# tests/test_gradcam.py          ~20 tests   ✅
-# tests/test_reporting.py        ~25 tests   ✅
-# tests/test_gallery.py          ~25 tests   ✅
-# tests/test_health.py           ~25 tests   ✅
-# tests/test_training_manager.py ~20 tests   ✅
-# ─────────────────────────────────────────────────────────────────────────────
-# TOTAL: ~255 unit tests — 0 failures
+# Full suite — nothing broken
+pytest tests/ -v -m "not integration"
 
-# ── 2. Integration tests (requires Malimg + trained model) ────────────────────
-pytest tests/test_integration.py -v
-# Expected: all 8 integration tests pass when dataset + model available
+# Verify ELF fix
+python -c "
+from modules.binary_to_image.utils import validate_binary_format
+elf_bytes = b'\\x7fELF' + b'\\x00' * 60
+fmt = validate_binary_format(elf_bytes)
+assert fmt == 'ELF', f'Expected ELF, got {fmt}'
+print('ELF validation: OK')
+"
 
-# ── 3. Import smoke tests ─────────────────────────────────────────────────────
-python -c "import modules.binary_to_image.converter"
-python -c "import modules.dataset.loader"
-python -c "import modules.enhancement.augmentor"
-python -c "import modules.detection.model"
-python -c "import modules.detection.gradcam"
-python -c "import modules.reporting"
-python -c "import modules.dashboard.health"
-python -c "import modules.dashboard.pages.training"
-python -c "import modules.dashboard.pages.gallery"
-python -c "import modules.training_manager"
+# Verify checkpoint fix
+python -c "
+import torch, tempfile
+from pathlib import Path
+from modules.detection.model import MalTwinCNN
+from modules.detection.inference import load_model
 
-# ── 4. CLI smoke tests ────────────────────────────────────────────────────────
-python scripts/train.py --help
-python scripts/evaluate.py --help
-python scripts/convert_binary.py --help
-
-# ── 5. MITRE verification ─────────────────────────────────────────────────────
-python verify_mitre.py
-# Expected: ✅ All 25 class names match MITRE JSON keys exactly.
-
-# ── 6. Full dashboard launch ──────────────────────────────────────────────────
-streamlit run modules/dashboard/app.py --server.port 8501
+model = MalTwinCNN(num_classes=25)
+with tempfile.TemporaryDirectory() as d:
+    pt = Path(d) / 'epoch_001.pt'
+    torch.save({'epoch': 1, 'model_state': model.state_dict(),
+                'optimizer_state': {}, 'val_acc': 0.85}, pt)
+    loaded = load_model(pt, 25, torch.device('cpu'))
+    print('Checkpoint load from model_state key: OK')
+"
 ```
 
-### Final Manual Walkthrough (FYP Demo Sequence)
+### Checklist
 
-```
-1. Open http://localhost:8501
-   ✓ Home page loads — KPI cards show (zeros if no history)
-   ✓ Module status table: M2/M4/M6 green; M5/M7/M8 green if trained; M1 amber
-   ✓ System resource panel shows real CPU/RAM/uptime
-
-2. Navigate to 🏋️ Model Training (if not yet trained)
-   ✓ Configure epochs=5, click Start Training
-   ✓ Log appears, progress bar advances per epoch
-   ✓ Completion banner appears, model auto-loaded into session
-
-3. Navigate to 📂 Binary Upload
-   ✓ Upload tests/fixtures/sample_pe.exe
-   ✓ Grayscale image renders in < 3 seconds
-   ✓ Metadata table shows name, size, format, SHA-256
-   ✓ Pixel intensity histogram renders
-
-4. Navigate to 🔍 Malware Detection
-   ✓ File summary visible at top
-   ✓ Click ▶ Run Detection
-   ✓ Result banner appears with colour-coded confidence
-   ✓ Top-3 predictions listed
-   ✓ 25-class probability bar chart renders
-   ✓ MITRE ATT&CK for ICS table shows tactics + techniques
-   ✓ Check "Generate Grad-CAM Heatmap"
-   ✓ Overlay + raw heatmap render side by side
-   ✓ Interpretation text shown below heatmaps
-   ✓ Click 📄 Generate PDF Report → Download PDF button appears
-   ✓ PDF opens in browser — 3 pages, heatmap embedded on page 3
-   ✓ Click 📥 Download JSON Report → valid JSON downloaded
-
-5. Navigate to 🖼️ Dataset Gallery
-   ✓ Overview strip shows one image per family
-   ✓ Family selector changes the detail grid
-   ✓ MITRE context expander shows for selected family
-
-6. Navigate to 🏠 Dashboard
-   ✓ Detection history table shows the logged event
-   ✓ Filter by family works
-   ✓ Export to CSV downloads valid CSV
-
-7. Navigate to 🖥️ Digital Twin
-   ✓ Stub page renders — deferred message shown
-```
-
----
-
-## Checklist — Step 6 Complete
-
-- [ ] `pytest tests/ -v -m "not integration"` — 0 failures across all 10 test files
-- [ ] `tests/test_integration.py` exists and all integration tests pass when dataset available
-- [ ] `SRS_COMPLIANCE.md` exists at repo root
-- [ ] `config.py` has `CONFIDENCE_GREEN`, `CONFIDENCE_AMBER`, `MITRE_JSON_PATH`, `REPORTS_DIR`
-- [ ] `app.py` has `_check_network_binding()` — SEC-5 implemented
-- [ ] `verify_mitre.py` outputs `✅ All 25 class names match MITRE JSON keys exactly`
-- [ ] All `st.error()` messages follow USE-3 format (what + cause + action)
-- [ ] Full manual walkthrough in demo sequence passes without errors
-- [ ] 6-page sidebar navigation works — no routing bugs
-- [ ] `SRS_COMPLIANCE.md` shows 14/18 FR implemented, 4 deferred (all Digital Twin)
-
----
-
-*All 6 steps complete. MalTwin ML pipeline, dashboard, XAI, reporting, gallery, history, training, and health monitoring are fully implemented and SRS-compliant. Digital Twin (M1) remains as a future sprint.*
+- [ ] `upload.py` — type list includes `"elf"`, help text explains rename workflow, ELF expander added
+- [ ] `inference.py` — `_looks_like_state_dict()` helper exists, key list includes `"model_state"`
+- [ ] New test: `test_loads_from_full_checkpoint_dict_model_state_key` passes
+- [ ] New test: `test_load_model_raises_helpful_error_for_unknown_checkpoint_keys` passes
+- [ ] `db.py` — `log_report_event()` and `_ensure_report_table()` added
+- [ ] `detection.py` — `log_report_event()` called after both PDF and JSON generation
+- [ ] New tests: `TestLogReportEvent` (4 tests) pass
+- [ ] `home.py` — baseline top-5 feed visible without opening expander
+- [ ] `home.py` — full history inside `st.expander`
+- [ ] `home.py` — FR1.1 TTL deviation disclosed in caption
+- [ ] `detection.py` — benign class architectural notice added below confidence bar
+- [ ] `app.py` — model staleness check added to `load_global_resources()`
+- [ ] `SRS_COMPLIANCE.md` — FR1.1 and SI-5 deviations documented with footnotes
+- [ ] `MalimgDataset.__init__` docstring explains SI-5 deviation rationale
+- [ ] `pytest tests/ -v -m "not integration"` — 0 failures
