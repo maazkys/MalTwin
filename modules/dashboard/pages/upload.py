@@ -17,7 +17,6 @@ from modules.binary_to_image.utils import (
 )
 from modules.dashboard import state
 
-
 def render():
     st.title("📂 Binary Upload & Visualization")
     st.markdown(
@@ -34,11 +33,26 @@ def render():
         type=["exe", "dll", "elf"],
         help=(
             "Accepted formats: PE (.exe, .dll) or ELF (.elf) binaries. "
-            "ELF binaries have no extension — rename to .elf if needed. "
-            f"Maximum file size: {config.MAX_UPLOAD_BYTES // (1024 * 1024)} MB."
+            "ELF binaries from Linux/IIoT systems have no extension by default — "
+            "rename them to .elf before uploading (e.g. mv malware malware.elf). "
+            f"Maximum file size: {config.MAX_UPLOAD_BYTES // (1024 * 1024)} MB. "
+            "Format is validated by magic bytes, not extension."
         ),
         key="binary_uploader",
     )
+
+    with st.expander("ℹ️ Uploading ELF binaries (Linux/IIoT malware)", expanded=False):
+        st.markdown(
+            "ELF binaries from Linux-based IIoT devices (PLCs, routers, embedded systems) "
+            "typically have no file extension. To upload them:\n\n"
+            "1. Rename the file to add a `.elf` extension:\n"
+            "   ```bash\n"
+            "   mv suspicious_binary suspicious_binary.elf\n"
+            "   ```\n"
+            "2. Upload the renamed file using the uploader above.\n\n"
+            "The system validates format using ELF magic bytes (`\\x7fELF`), "
+            "not the file extension — the extension is only required by the browser file picker."
+        )
 
     if uploaded_file is not None:
         _process_upload(uploaded_file)
