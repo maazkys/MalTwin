@@ -46,7 +46,7 @@ def load_model(
     # ── 2. Extract state_dict regardless of how it was saved ────────────────
     if isinstance(raw, dict) and not _looks_like_state_dict(raw):
         # Likely a full checkpoint dict — try common key names
-        for key in ("model_state_dict", "state_dict", "model"):
+        for key in ("model_state_dict", "state_dict", "model", "model_state"):
             if key in raw:
                 state_dict = raw[key]
                 break
