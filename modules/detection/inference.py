@@ -43,16 +43,20 @@ def load_model(
     # ── 1. Load raw checkpoint ───────────────────────────────────────────────
     raw = torch.load(str(model_path), map_location=device, weights_only=True)
 
-    # ── 2. Extract state_dict regardless of how it was saved ────────────────
+    # ── Extract state_dict regardless of how it was saved ──────────────────
     if isinstance(raw, dict) and not _looks_like_state_dict(raw):
-        # Likely a full checkpoint dict — try common key names
+        # Full checkpoint dict — try all known key names
+        state_dict = None
         for key in ("model_state_dict", "state_dict", "model", "model_state"):
             if key in raw:
                 state_dict = raw[key]
                 break
-        else:
-            # Fallback: assume it is the state_dict after all
-            state_dict = raw
+        if state_dict is None:
+            raise ValueError(
+                f"Cannot find model weights in checkpoint at {model_path}. "
+                f"Keys found: {list(raw.keys())}. "
+                "Expected one of: model_state_dict, state_dict, model, model_state."
+            )
     else:
         state_dict = raw
 
@@ -111,9 +115,15 @@ def load_model(
 def _looks_like_state_dict(d: dict) -> bool:
     """
     Heuristic: a raw state_dict has tensor values.
-    A checkpoint dict typically has non-tensor values (epoch, loss, etc.).
+    A checkpoint dict has mixed types (int epoch, dict optimizer_state, etc.).
+    Returns True if d looks like a state dict (all or mostly tensor values).
     """
-    return all(isinstance(v, torch.Tensor) for v in d.values())
+    import torch
+    if not d:
+        return False
+    values = list(d.values())
+    tensor_count = sum(1 for v in values if isinstance(v, torch.Tensor))
+    return tensor_count / len(values) >= 0.8
 
 
 def _infer_num_classes(state_dict: dict) -> int | None:

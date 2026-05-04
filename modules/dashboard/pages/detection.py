@@ -239,6 +239,14 @@ def _render_results() -> None:
     col_bar.progress(confidence_pct)
     col_label.markdown(f"**{confidence_pct}%** {color_label}")
 
+    # Benign class notice (architectural constraint — SRS_COMPLIANCE.md)
+    st.caption(
+        "ℹ️ MalTwin classifies binaries into known malware families only. "
+        "There is no benign class — every uploaded binary receives a malware family prediction. "
+        "Low confidence scores (<50%) indicate the binary may not match any trained family. "
+        "This is a known architectural constraint of the Malimg-trained model."
+    )
+
     # ── B: Top-3 Predictions ──────────────────────────────────────────────────
     st.markdown("**Top 3 Predictions:**")
     for i, pred in enumerate(result['top3'], 1):
@@ -323,6 +331,15 @@ def _render_results() -> None:
                     "Action: Use the JSON download instead."
                 )
             else:
+                # Log report generation (UC-03 postcondition)
+                from modules.dashboard.db import log_report_event
+                log_report_event(
+                    config.DB_PATH,
+                    detection_event_id=None,   # not tracked in session state
+                    sha256=report_data['sha256'],
+                    report_format='PDF',
+                    gradcam_included=report_data['gradcam'].get('generated', False),
+                )
                 meta = st.session_state[state.KEY_FILE_META]
                 st.download_button(
                     label="📥 Download PDF Report",
@@ -334,7 +351,16 @@ def _render_results() -> None:
 
     with col_json:
         from modules.reporting.json_report import generate_json_report
+        from modules.dashboard.db import log_report_event
         json_bytes = generate_json_report(report_data)
+        # Log JSON report generation (UC-03 postcondition)
+        log_report_event(
+            config.DB_PATH,
+            detection_event_id=None,
+            sha256=report_data['sha256'],
+            report_format='JSON',
+            gradcam_included=report_data['gradcam'].get('generated', False),
+        )
         meta = st.session_state[state.KEY_FILE_META]
         st.download_button(
             label="📥 Download JSON Report",

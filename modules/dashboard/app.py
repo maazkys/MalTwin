@@ -89,18 +89,34 @@ def load_global_resources() -> None:
         except FileNotFoundError:
             st.session_state[state.KEY_CLASS_NAMES] = None
 
-    # ── Model ─────────────────────────────────────────────────────────────────
+    # ── Staleness check ─────────────────────────────────────────────────────
+    # If model is loaded but the file on disk has a newer mtime,
+    # reset and reload. Handles CLI training completing mid-session.
+    if st.session_state[state.KEY_MODEL_LOADED]:
+        try:
+            stored_mtime = st.session_state.get('_model_mtime', 0)
+            current_mtime = config.BEST_MODEL_PATH.stat().st_mtime
+            if current_mtime > stored_mtime + 1:   # +1s tolerance
+                # Model file changed — reset and reload
+                st.session_state[state.KEY_MODEL]        = None
+                st.session_state[state.KEY_MODEL_LOADED] = False
+                st.session_state['_model_mtime']         = 0
+        except Exception:
+            pass
+
+    # ── Model load ──────────────────────────────────────────────────────────
     if (
         st.session_state[state.KEY_MODEL] is None
         and st.session_state[state.KEY_CLASS_NAMES] is not None
     ):
         try:
             with st.spinner("Loading detection model…"):
-                num_classes = config.MALIMG_EXPECTED_FAMILIES
+                num_classes = len(st.session_state[state.KEY_CLASS_NAMES])
                 model = load_model(config.BEST_MODEL_PATH, num_classes, config.DEVICE)
                 st.session_state[state.KEY_MODEL]        = model
                 st.session_state[state.KEY_MODEL_LOADED] = True
                 st.session_state[state.KEY_DEVICE_INFO]  = str(config.DEVICE)
+                st.session_state['_model_mtime']         = config.BEST_MODEL_PATH.stat().st_mtime
         except FileNotFoundError:
             st.session_state[state.KEY_MODEL_LOADED] = False
 

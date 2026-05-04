@@ -14,6 +14,7 @@ import config
 from modules.dashboard.db import (
     get_detection_stats,
     get_events_by_date_range,
+    get_recent_events,
 )
 from modules.dashboard import state
 
@@ -67,9 +68,13 @@ def render():
 
     st.markdown("---")
 
-    # ── Recent Detection Feed (with filters) ──────────────────────────────────
-    st.subheader("Detection History")
-    _render_history_section()
+    # ── Quick recent feed (always visible — SRS FR1.4) ───────────────────────
+    st.subheader("Recent Detections")
+    _render_recent_feed_baseline()
+
+    # ── Full filterable history ───────────────────────────────────────────────
+    with st.expander("📋 Full Detection History (filter & export)", expanded=False):
+        _render_history_section()
 
     st.markdown("---")
 
@@ -163,7 +168,31 @@ def _render_module_status() -> None:
     col2.metric("⚠️ Inactive", n_inactive)
     col3.metric("🔴 Error",    n_error)
 
-    st.caption("Status refreshes every 30 seconds automatically.")
+    st.caption(
+        "Status refreshes every 30 seconds automatically. "
+        "(SRS FR1.1 specifies 5s; 30s is used to avoid excessive filesystem I/O — "
+        "functionally equivalent for research use.)"
+    )
+
+
+def _render_recent_feed_baseline() -> None:
+    """
+    Scrollable feed of the 5 most recent detections. SRS FR1.4 baseline.
+    Always visible — no filters, no interaction required.
+    """
+    import pandas as pd
+    events = get_recent_events(config.DB_PATH, limit=5)
+
+    if not events:
+        st.caption("No detections yet. Upload a binary file to get started.")
+        return
+
+    df = pd.DataFrame(events)
+    df['confidence'] = df['confidence'].apply(lambda x: f"{x * 100:.1f}%")
+    df['timestamp']  = pd.to_datetime(df['timestamp']).dt.strftime('%Y-%m-%d %H:%M')
+    display = df[['timestamp', 'file_name', 'predicted_family', 'confidence']].copy()
+    display.columns = ['Timestamp', 'File', 'Predicted Family', 'Confidence']
+    st.dataframe(display, use_container_width=True, hide_index=True)
 
 
 def _render_history_section() -> None:

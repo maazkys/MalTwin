@@ -238,3 +238,36 @@ class TestEdgeCases:
         _log(db_mod, tmp_db, file_format="ELF", sha256="h" * 64)
         results = db_mod.get_recent_events(tmp_db)
         assert any(r.get("file_format") == "ELF" for r in results)
+
+
+# ===========================================================================
+# log_report_event
+# ===========================================================================
+
+class TestLogReportEvent:
+    def test_does_not_raise(self, db_mod, tmp_db):
+        from modules.dashboard.db import log_report_event
+        log_report_event(tmp_db, None, 'a' * 64, 'PDF', False)
+
+    def test_creates_report_events_table(self, db_mod, tmp_db):
+        from modules.dashboard.db import log_report_event, get_connection
+        log_report_event(tmp_db, None, 'a' * 64, 'JSON', True)
+        with get_connection(tmp_db) as conn:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='report_events'"
+            ).fetchall()
+        assert len(rows) == 1
+
+    def test_inserted_values_correct(self, db_mod, tmp_db):
+        from modules.dashboard.db import log_report_event, get_connection
+        log_report_event(tmp_db, 42, 'b' * 64, 'PDF', True)
+        with get_connection(tmp_db) as conn:
+            row = conn.execute("SELECT * FROM report_events").fetchone()
+        assert dict(row)['sha256'] == 'b' * 64
+        assert dict(row)['report_format'] == 'PDF'
+        assert dict(row)['gradcam_included'] == 1
+
+    def test_does_not_raise_on_missing_db(self, db_mod, tmp_path):
+        from modules.dashboard.db import log_report_event
+        bad_path = tmp_path / "nonexistent_dir" / "db.db"
+        log_report_event(bad_path, None, 'a' * 64, 'JSON', False)

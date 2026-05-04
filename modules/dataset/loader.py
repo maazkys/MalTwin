@@ -58,6 +58,17 @@ class MalimgDataset(Dataset):
         test_ratio: float = config.TEST_RATIO,
         random_seed: int = config.RANDOM_SEED,
     ):
+        """
+        Custom PyTorch Dataset for the Malimg malware image dataset.
+
+        Deviation from SRS SI-5: The SRS specifies PyTorch ImageFolder.
+        This custom class is used instead because it provides:
+          - Stratified train/val/test splitting (ImageFolder has no split support)
+          - Per-split class count tracking (needed by ClassAwareOversampler)
+          - Integration with WeightedRandomSampler for class balancing
+
+        The interface is otherwise Dataset-compatible (len, getitem, get_labels).
+        """
         if not data_dir.exists():
             raise FileNotFoundError(f"Dataset directory not found: {data_dir}")
         if split not in ('train', 'val', 'test'):
