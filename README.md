@@ -360,7 +360,7 @@ Integration tests are marked `@pytest.mark.integration` and require the Malimg d
 | Page | Description |
 |------|-------------|
 | 🏠 Dashboard | KPI cards (total analyzed, malware count, model accuracy), 7-day activity chart, detection history with filters + CSV export, system stats, module status |
-| 📂 Binary Upload | Upload `.exe`, `.dll`, or `.elf` (ELF files must be renamed), validates magic bytes, 50 MB limit, shows metadata table + pixel histogram |
+| 📂 Binary Upload | Upload `.exe`, `.dll`, or `.elf` (ELF binaries without extensions should be renamed to `.elf` for upload), validates magic bytes, 50 MB limit, shows metadata table + pixel histogram |
 | 🔍 Malware Detection | Run CNN inference on the uploaded binary, shows predicted family with confidence bar (green/amber/red), top-3 predictions, full 25-class probability chart, MITRE ATT&CK for ICS mapping, PDF/JSON report export |
 | 🖼️ Dataset Gallery | Per-family gallery with MITRE context expander |
 | 🏋️ Model Training | Configure and run training from the dashboard with live logs and progress |
@@ -378,7 +378,7 @@ Most settings live in `.env` (copied from `.env.example`). `config.py` reads the
 | `MALTWIN_PROCESSED_DIR` | `./data/processed` | Processed artifacts (class_names, metrics, confusion matrix) |
 | `MALTWIN_MODEL_DIR` | `./models` | Model checkpoints and best model path |
 | `MALTWIN_LOG_DIR` | `./logs` | SQLite detection database directory |
-| `MALTWIN_REPORTS_DIR` | `./reports` | PDF/JSON report output directory (config.py fallback: `data/reports`) |
+| `MALTWIN_REPORTS_DIR` | `./reports` | PDF/JSON report output directory (config.py fallback: `./data/reports`) |
 | `MALTWIN_IMG_SIZE` | `128` | Output image size (N×N) |
 | `MALTWIN_BATCH_SIZE` | `32` | Training batch size |
 | `MALTWIN_EPOCHS` | `30` | Training epochs |
