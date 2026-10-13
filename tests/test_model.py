@@ -123,9 +123,16 @@ class TestArchitectureStructure:
 class TestTrainingBehaviour:
 
     def test_loss_decreases_on_overfit_single_batch(self, detection_mod):
+        # Seeded and with dropout disabled so the check is deterministic:
+        # the test asks "can the network fit one batch?", not "does it
+        # fit despite random dropout masks on random data?".
         model_mod, _ = detection_mod
+        torch.manual_seed(0)
         net = model_mod.MalTwinCNN(num_classes=NUM_CLASSES)
         net.train()
+        for m in net.modules():
+            if isinstance(m, (nn.Dropout, nn.Dropout2d)):
+                m.p = 0.0
         x = torch.rand(4, 1, IMG_SIZE, IMG_SIZE)
         y = torch.randint(0, NUM_CLASSES, (4,))
         criterion = nn.CrossEntropyLoss()

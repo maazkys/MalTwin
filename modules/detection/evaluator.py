@@ -10,7 +10,13 @@ from sklearn.metrics import (
     precision_recall_fscore_support,
     confusion_matrix,
     classification_report,
+    roc_auc_score,
+    roc_curve,
+    matthews_corrcoef,
+    cohen_kappa_score,
+    top_k_accuracy_score,
 )
+from sklearn.preprocessing import label_binarize
 from torch.utils.data import DataLoader
 import config
 from .model import MalTwinCNN
@@ -56,16 +62,20 @@ def evaluate(
     model.eval()
     all_preds  = []
     all_labels = []
+    all_probs  = []
 
     with torch.no_grad():
         for inputs, labels in test_loader:
             inputs = inputs.to(device)
             outputs = model(inputs)
-            preds = outputs.argmax(dim=1).cpu().numpy()
-            all_preds.extend(preds.tolist())
+            probs = torch.softmax(outputs, dim=1).cpu().numpy()
+            all_probs.append(probs)
+            all_preds.extend(probs.argmax(axis=1).tolist())
             all_labels.extend(labels.numpy().tolist())
 
     num_classes = len(class_names)
+    probs_arr = (np.concatenate(all_probs, axis=0) if all_probs
+                 else np.zeros((0, num_classes)))
 
     # Overall metrics
     accuracy = accuracy_score(all_labels, all_preds)
@@ -102,7 +112,12 @@ def evaluate(
         zero_division=0,
     )
 
+    extended = compute_extended_metrics(
+        np.asarray(all_labels), probs_arr, cm, class_names
+    )
+
     return {
+        **extended,
         'accuracy':              float(accuracy),
         'precision_macro':       float(prec_macro),
         'recall_macro':          float(rec_macro),
@@ -114,7 +129,145 @@ def evaluate(
         'per_class':             per_class,
         'classification_report': report,
         'num_test_samples':      len(all_labels),
+        # Raw arrays kept for plotting (not JSON-serialisable; stripped on save)
+        'y_true':                np.asarray(all_labels),
+        'y_prob':                probs_arr,
     }
+
+
+def compute_extended_metrics(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    cm: np.ndarray,
+    class_names: list[str],
+) -> dict:
+    """
+    Metrics beyond accuracy/P/R/F1, as listed in the project evaluation plan:
+
+      - roc_auc_macro / roc_auc_weighted : one-vs-rest ROC-AUC over all classes
+      - fpr_macro                        : mean per-class false positive rate
+      - per_class_fpr                    : FP / (FP + TN) for each family
+      - top3_accuracy                    : true family is in the top-3 predictions
+      - mcc                              : Matthews correlation coefficient
+      - cohen_kappa                      : agreement beyond chance
+
+    FPR matters for IIoT: a false alarm can stop a production line, so we
+    report it explicitly rather than leaving it implied by precision.
+
+    Any metric that is undefined for the given data (e.g. ROC-AUC when a
+    class is missing from the test split) is returned as None instead of
+    raising, so evaluation of small or partial datasets still completes.
+    """
+    num_classes = len(class_names)
+    labels = list(range(num_classes))
+    out: dict = {}
+
+    # Per-class FPR from the confusion matrix
+    cm = np.asarray(cm, dtype=np.int64)
+    total = cm.sum()
+    tp = np.diag(cm)
+    fp = cm.sum(axis=0) - tp
+    fn = cm.sum(axis=1) - tp
+    tn = total - tp - fp - fn
+    with np.errstate(divide='ignore', invalid='ignore'):
+        fpr = np.where((fp + tn) > 0, fp / (fp + tn), 0.0)
+    out['per_class_fpr'] = {class_names[i]: float(fpr[i]) for i in range(num_classes)}
+    out['fpr_macro'] = float(fpr.mean()) if num_classes else 0.0
+
+    y_pred = y_prob.argmax(axis=1) if len(y_prob) else np.array([], dtype=int)
+
+    try:
+        out['mcc'] = float(matthews_corrcoef(y_true, y_pred))
+    except Exception:
+        out['mcc'] = None
+    try:
+        out['cohen_kappa'] = float(cohen_kappa_score(y_true, y_pred))
+    except Exception:
+        out['cohen_kappa'] = None
+
+    try:
+        k = min(3, num_classes - 1) if num_classes > 2 else 1
+        out['top3_accuracy'] = float(
+            top_k_accuracy_score(y_true, y_prob, k=k, labels=labels)
+        ) if num_classes > 2 else None
+    except Exception:
+        out['top3_accuracy'] = None
+
+    # One-vs-rest ROC-AUC — only defined for classes present in y_true
+    present = sorted(set(int(c) for c in np.unique(y_true)))
+    out['roc_auc_macro'] = None
+    out['roc_auc_weighted'] = None
+    out['per_class_auc'] = {}
+    if len(present) >= 2 and len(y_prob):
+        y_bin = label_binarize(y_true, classes=labels)
+        aucs, weights = [], []
+        for c in present:
+            pos = y_bin[:, c]
+            if pos.min() == pos.max():
+                continue
+            try:
+                a = float(roc_auc_score(pos, y_prob[:, c]))
+            except ValueError:
+                continue
+            out['per_class_auc'][class_names[c]] = a
+            aucs.append(a)
+            weights.append(int(pos.sum()))
+        if aucs:
+            out['roc_auc_macro'] = float(np.mean(aucs))
+            out['roc_auc_weighted'] = float(np.average(aucs, weights=weights))
+
+    return out
+
+
+def plot_roc_curves(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    class_names: list[str],
+    output_path: Path,
+) -> None:
+    """
+    One-vs-rest ROC curves plus the micro-average curve, saved as PNG.
+    Classes absent from y_true are skipped.
+    """
+    labels = list(range(len(class_names)))
+    y_bin = label_binarize(y_true, classes=labels)
+    if y_bin.shape[1] == 1:  # binary edge case from label_binarize
+        y_bin = np.hstack([1 - y_bin, y_bin])
+
+    fig, ax = plt.subplots(figsize=(9, 8))
+    cmap = plt.get_cmap('tab20')
+    for c in labels:
+        pos = y_bin[:, c]
+        if pos.min() == pos.max():
+            continue
+        f, t, _ = roc_curve(pos, y_prob[:, c])
+        ax.plot(f, t, lw=0.9, alpha=0.75, color=cmap(c % 20), label=class_names[c])
+
+    f, t, _ = roc_curve(y_bin.ravel(), y_prob.ravel())
+    ax.plot(f, t, lw=2.5, color='black', label='micro-average')
+    ax.plot([0, 1], [0, 1], ls='--', lw=1, color='grey')
+    ax.set_xlabel('False Positive Rate')
+    ax.set_ylabel('True Positive Rate')
+    ax.set_title('MalTwin One-vs-Rest ROC Curves')
+    ax.legend(fontsize=6, ncol=2, loc='lower right')
+    plt.tight_layout()
+    plt.savefig(str(output_path), dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
+def plot_training_curves(history: dict, output_path: Path) -> None:
+    """Train/val loss and accuracy per epoch, saved as a two-panel PNG."""
+    epochs = range(1, len(history.get('train_loss', [])) + 1)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
+    ax1.plot(epochs, history['train_loss'], label='train')
+    ax1.plot(epochs, history['val_loss'], label='validation')
+    ax1.set_title('Loss'); ax1.set_xlabel('Epoch'); ax1.legend()
+    ax2.plot(epochs, history['train_acc'], label='train')
+    ax2.plot(epochs, history['val_acc'], label='validation')
+    ax2.set_title('Accuracy'); ax2.set_xlabel('Epoch'); ax2.legend()
+    plt.tight_layout()
+    plt.savefig(str(output_path), dpi=150, bbox_inches='tight')
+    plt.close(fig)
 
 
 def plot_confusion_matrix(
@@ -185,6 +338,12 @@ def format_metrics_table(metrics: dict, class_names: list[str]) -> str:
         row('Recall (macro):', metrics['recall_macro']),
         row('F1 (macro):', metrics['f1_macro']),
         row('F1 (weighted):', metrics['f1_weighted']),
+        *( [row('ROC-AUC (macro):', metrics['roc_auc_macro'])]
+           if metrics.get('roc_auc_macro') is not None else [] ),
+        *( [row('FPR (macro):', metrics['fpr_macro'])]
+           if metrics.get('fpr_macro') is not None else [] ),
+        *( [row('MCC:', metrics['mcc'])]
+           if metrics.get('mcc') is not None else [] ),
         row('Test Samples:', metrics['num_test_samples']),
         border_mid,
         f"║{'Per-Class F1 (5 worst):':^{width}}║",

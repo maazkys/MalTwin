@@ -26,6 +26,24 @@ DB_PATH          = LOG_DIR / "maltwin.db"
 BEST_MODEL_PATH       = MODEL_DIR / "best_model.pt"
 EVAL_METRICS_PATH     = PROCESSED_DIR / "eval_metrics.json"
 CONFUSION_MATRIX_PATH = PROCESSED_DIR / "confusion_matrix.png"
+ROC_CURVE_PATH        = PROCESSED_DIR / "roc_curves.png"
+TRAINING_CURVES_PATH  = PROCESSED_DIR / "training_curves.png"
+TRAINING_HISTORY_PATH = PROCESSED_DIR / "training_history.json"
+UNSEEN_EVAL_PATH      = PROCESSED_DIR / "unseen_family_eval.json"
+
+# ── Dynamic analysis (behavioural, IoT-23 / Digital Twin conn.log) ─────────────
+DYNAMIC_DATA_DIR            = Path(os.getenv("MALTWIN_DYNAMIC_DATA_DIR", str(BASE_DIR / "data/iot23")))
+DYNAMIC_MODEL_PATH          = MODEL_DIR / "dynamic_model.joblib"
+DYNAMIC_METRICS_PATH        = PROCESSED_DIR / "dynamic_metrics.json"
+DYNAMIC_CM_PATH             = PROCESSED_DIR / "dynamic_confusion_matrix.png"
+DYNAMIC_IMPORTANCE_PATH     = PROCESSED_DIR / "dynamic_feature_importance.png"
+MITRE_BEHAVIOUR_JSON_PATH   = BASE_DIR / "data" / "mitre_ics_behaviour_mapping.json"
+
+# ── Hybrid fusion ──────────────────────────────────────────────────────────────
+FUSION_STATIC_WEIGHT  = float(os.getenv("MALTWIN_FUSION_STATIC_WEIGHT",  "0.5"))
+FUSION_DYNAMIC_WEIGHT = float(os.getenv("MALTWIN_FUSION_DYNAMIC_WEIGHT", "0.5"))
+FUSION_MALICIOUS_THRESHOLD  = float(os.getenv("MALTWIN_FUSION_MALICIOUS",  "0.70"))
+FUSION_SUSPICIOUS_THRESHOLD = float(os.getenv("MALTWIN_FUSION_SUSPICIOUS", "0.40"))
 
 # Create directories at import time (safe to call repeatedly)
 for _dir in [PROCESSED_DIR, MODEL_DIR, CHECKPOINT_DIR, LOG_DIR, REPORTS_DIR]:
@@ -33,6 +51,9 @@ for _dir in [PROCESSED_DIR, MODEL_DIR, CHECKPOINT_DIR, LOG_DIR, REPORTS_DIR]:
 
 # ── Image settings ─────────────────────────────────────────────────────────────
 IMG_SIZE = int(os.getenv("MALTWIN_IMG_SIZE", "128"))
+# 2-D byte layout before resizing: 'malimg' matches how the training images were
+# built (Nataraj et al. 2011 width table); 'square' is the earlier sqrt layout.
+IMAGE_LAYOUT = os.getenv("MALTWIN_IMAGE_LAYOUT", "malimg")
 
 # ── Training hyperparameters ───────────────────────────────────────────────────
 BATCH_SIZE   = int(os.getenv("MALTWIN_BATCH_SIZE",   "32"))

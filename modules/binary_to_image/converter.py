@@ -18,7 +18,11 @@ class BinaryConverter:
 
     Conversion algorithm:
         1. Read file bytes as flat uint8 numpy array via np.frombuffer.
-        2. Determine 2D width:  width = max(1, int(math.sqrt(len(byte_array))))
+        2. Determine 2D width from the layout:
+             'malimg' (default) — Nataraj et al. (2011) file-size → width table,
+                       the same rule used to build the Malimg training images,
+                       so uploaded binaries match the training distribution.
+             'square' — width = max(1, int(math.sqrt(len(byte_array))))
         3. Determine rows:      rows  = len(byte_array) // width
         4. Trim array to exact (rows * width) length (discard tail bytes).
         5. Reshape to (rows, width) 2D array.
@@ -34,10 +38,41 @@ class BinaryConverter:
             if img_size <= 0.
     """
 
-    def __init__(self, img_size: int = config.IMG_SIZE) -> None:
+    # Nataraj et al., "Malware Images: Visualization and Automatic
+    # Classification", VizSec 2011 — image width by file size.
+    MALIMG_WIDTH_TABLE = [
+        (10 * 1024,    32),
+        (30 * 1024,    64),
+        (60 * 1024,   128),
+        (100 * 1024,  256),
+        (200 * 1024,  384),
+        (500 * 1024,  512),
+        (1000 * 1024, 768),
+    ]
+    MALIMG_MAX_WIDTH = 1024
+
+    def __init__(self, img_size: int = config.IMG_SIZE,
+                 layout: str = config.IMAGE_LAYOUT) -> None:
         if img_size <= 0:
             raise ValueError(f"img_size must be a positive integer, got {img_size}")
+        if layout not in ('malimg', 'square'):
+            raise ValueError(f"layout must be 'malimg' or 'square', got {layout!r}")
         self.img_size = img_size
+        self.layout = layout
+
+    @classmethod
+    def malimg_width(cls, n_bytes: int) -> int:
+        """Image width Malimg would use for a file of n_bytes."""
+        for limit, width in cls.MALIMG_WIDTH_TABLE:
+            if n_bytes < limit:
+                return width
+        return cls.MALIMG_MAX_WIDTH
+
+    def _width(self, n_bytes: int) -> int:
+        if self.layout == 'malimg':
+            # Never wider than the data itself (tiny files): keep ≥ 2 rows
+            return max(1, min(self.malimg_width(n_bytes), n_bytes // 2))
+        return max(1, int(math.sqrt(n_bytes)))
 
     def convert(self, file_bytes: bytes) -> np.ndarray:
         """
@@ -60,7 +95,7 @@ class BinaryConverter:
             )
         byte_array = np.frombuffer(file_bytes, dtype=np.uint8)
         n = len(byte_array)
-        width = max(1, int(math.sqrt(n)))
+        width = self._width(n)
         rows  = n // width
         trimmed   = byte_array[:rows * width]
         reshaped  = trimmed.reshape((rows, width))

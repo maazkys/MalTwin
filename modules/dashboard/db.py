@@ -29,7 +29,7 @@ import sqlite3
 import sys
 import time
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import config
@@ -107,7 +107,7 @@ def log_detection_event(
     Insert one detection event. Retries once on failure.
     NEVER raises — a DB failure must not block displaying the detection result.
     """
-    timestamp = datetime.utcnow().isoformat()
+    timestamp = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
     sql = """
         INSERT INTO detection_events
             (timestamp, file_name, sha256, file_format, file_size,
@@ -150,7 +150,7 @@ def log_report_event(
     # Ensure the report_events table exists first
     _ensure_report_table(db_path)
 
-    timestamp = datetime.utcnow().isoformat()
+    timestamp = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
     sql = """
         INSERT INTO report_events
             (timestamp, detection_event_id, sha256, report_format, gradcam_included)
@@ -260,7 +260,7 @@ def get_events_by_date_range(db_path: Path, days_back: int = 7) -> list[dict]:
     if not db_path.exists():
         return []
     try:
-        cutoff = (datetime.utcnow() - timedelta(days=days_back)).isoformat()
+        cutoff = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days_back)).isoformat()
         with get_connection(db_path) as conn:
             rows = conn.execute(
                 "SELECT timestamp, predicted_family FROM detection_events "
@@ -314,7 +314,7 @@ def get_filtered_events(
             params.append(min_confidence)
 
         if days_back is not None:
-            cutoff = (datetime.utcnow() - timedelta(days=days_back)).isoformat()
+            cutoff = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days_back)).isoformat()
             clauses.append('timestamp >= ?')
             params.append(cutoff)
 

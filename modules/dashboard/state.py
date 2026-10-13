@@ -20,6 +20,10 @@ KEY_TRAINING_JOB   = 'training_job'     # TrainingJob instance or None
 KEY_TRAINING_STATE = 'training_state'   # TrainingJobState dict snapshot or None
 KEY_HEATMAP      = 'gradcam_heatmap'   # dict from generate_gradcam() or None
 KEY_MODEL_MTIME  = 'model_mtime'       # float epoch seconds for model file
+KEY_DYNAMIC_MODEL  = 'dynamic_model'     # DynamicDetector or None
+KEY_DYNAMIC_REPORT = 'dynamic_report'    # dict from DynamicReport.to_dict() or None
+KEY_DYNAMIC_SOURCE = 'dynamic_source'    # dict {'name': str, 'synthetic': bool} or None
+KEY_FUSION_RESULT  = 'fusion_result'     # dict from FusionResult.to_dict() or None
 
 
 def init_session_state() -> None:
@@ -40,6 +44,10 @@ def init_session_state() -> None:
         KEY_TRAINING_STATE: None,
         KEY_HEATMAP:      None,
         KEY_MODEL_MTIME:  0,
+        KEY_DYNAMIC_MODEL:  None,
+        KEY_DYNAMIC_REPORT: None,
+        KEY_DYNAMIC_SOURCE: None,
+        KEY_FUSION_RESULT:  None,
     }
     for key, default in defaults.items():
         if key not in st.session_state:
@@ -47,8 +55,8 @@ def init_session_state() -> None:
 
     # Set start time once — only on very first run of the session
     if st.session_state[KEY_APP_START_TIME] is None:
-        from datetime import datetime
-        st.session_state[KEY_APP_START_TIME] = datetime.utcnow()
+        from datetime import datetime, timezone
+        st.session_state[KEY_APP_START_TIME] = datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def clear_file_state() -> None:

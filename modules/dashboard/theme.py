@@ -525,3 +525,19 @@ def apply_chart_theme(fig, title: str = '') -> None:
         yaxis=dict(gridcolor=COLORS['border'], linecolor=COLORS['border'], tickfont=dict(size=11)),
         legend=dict(font=dict(size=11)),
     )
+
+
+def image_full_width(image, **kwargs) -> None:
+    """
+    st.image stretched to the column width on any Streamlit version.
+    Streamlit ≤1.39 uses `use_column_width`; ≥1.40 uses `use_container_width`
+    and newer releases removed `use_column_width` entirely.
+    """
+    import inspect
+    params = inspect.signature(st.image).parameters
+    if 'use_container_width' in params:
+        st.image(image, use_container_width=True, **kwargs)
+    elif 'use_column_width' in params:
+        st.image(image, use_column_width=True, **kwargs)
+    else:
+        st.image(image, **kwargs)

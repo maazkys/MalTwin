@@ -16,7 +16,7 @@ import io
 import sys
 import tempfile
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import config
@@ -38,7 +38,7 @@ class _MalTwinPDF(FPDF):
         self.cell(0, 10, '  MalTwin - IIoT Malware Detection Framework', fill=True, new_x='LMARGIN', new_y='NEXT')
         self.set_font('Helvetica', '', 8)
         self.set_text_color(120, 120, 120)
-        self.cell(0, 5, f'  Forensic Analysis Report | Generated {datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")} UTC', new_x='LMARGIN', new_y='NEXT')
+        self.cell(0, 5, f'  Forensic Analysis Report | Generated {datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")} UTC', new_x='LMARGIN', new_y='NEXT')
         self.set_text_color(0, 0, 0)
         self.ln(3)
 

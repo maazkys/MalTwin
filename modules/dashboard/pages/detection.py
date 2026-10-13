@@ -12,6 +12,7 @@ import config
 from modules.detection.inference import predict_single
 from modules.dashboard.db import log_detection_event
 from modules.dashboard import state
+from modules.dashboard.theme import mono
 
 
 def render():

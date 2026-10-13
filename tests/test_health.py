@@ -171,12 +171,12 @@ class TestCheckModule8Reporting:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestGetAllModuleStatuses:
-    def test_returns_list_of_eight(self):
+    def test_returns_list_of_ten(self):
         from modules.dashboard.health import get_all_module_statuses
         # Clear cache before calling to ensure fresh result
         get_all_module_statuses.clear()
         results = get_all_module_statuses()
-        assert len(results) == 8
+        assert len(results) == 10   # M1–M8 from the SRS + M9 dynamic + M10 fusion
 
     def test_each_entry_has_required_keys(self):
         from modules.dashboard.health import get_all_module_statuses
@@ -197,12 +197,12 @@ class TestGetAllModuleStatuses:
             assert r['status'] in ('active', 'inactive', 'error'), \
                 f"Module {r['id']} has invalid status: {r['status']}"
 
-    def test_module_ids_are_m1_through_m8(self):
+    def test_module_ids_are_m1_through_m10(self):
         from modules.dashboard.health import get_all_module_statuses
         get_all_module_statuses.clear()
         results = get_all_module_statuses()
         ids = [r['id'] for r in results]
-        assert ids == ['M1', 'M2', 'M3', 'M4', 'M5', 'M6', 'M7', 'M8']
+        assert ids == ['M1', 'M2', 'M3', 'M4', 'M5', 'M6', 'M7', 'M8', 'M9', 'M10']
 
     def test_does_not_raise(self):
         """get_all_module_statuses must never raise regardless of environment."""

@@ -5,7 +5,7 @@ Key facts from source:
 - BinaryConverter.convert() expects raw bytes (not a Path)
 - validate_binary_format() expects raw bytes (not a Path)
 - compute_sha256() expects raw bytes (not a Path)
-- histogram() takes a numpy array, returns {'bins': [...], 'counts': [...]}
+- compute_pixel_histogram() takes a numpy array, returns {'bins': [...], 'counts': [...]}
 """
 
 import hashlib
@@ -161,41 +161,77 @@ class TestHistogram:
 
     def test_returns_dict_with_bins_and_counts(self, converter_mod):
         _, utils = converter_mod
-        if not hasattr(utils, "histogram"):
-            pytest.skip("histogram not in utils")
         arr = np.random.randint(0, 256, (128, 128), dtype=np.uint8)
-        result = utils.histogram(arr)
+        result = utils.compute_pixel_histogram(arr)
         assert isinstance(result, dict)
         assert "bins" in result and "counts" in result
 
     def test_bins_length_256(self, converter_mod):
         _, utils = converter_mod
-        if not hasattr(utils, "histogram"):
-            pytest.skip("histogram not in utils")
         arr = np.zeros((128, 128), dtype=np.uint8)
-        result = utils.histogram(arr)
+        result = utils.compute_pixel_histogram(arr)
         assert len(result["bins"]) == 256
 
     def test_counts_length_256(self, converter_mod):
         _, utils = converter_mod
-        if not hasattr(utils, "histogram"):
-            pytest.skip("histogram not in utils")
         arr = np.zeros((128, 128), dtype=np.uint8)
-        result = utils.histogram(arr)
+        result = utils.compute_pixel_histogram(arr)
         assert len(result["counts"]) == 256
 
     def test_counts_sum_to_total_pixels(self, converter_mod):
         _, utils = converter_mod
-        if not hasattr(utils, "histogram"):
-            pytest.skip("histogram not in utils")
         arr = np.random.randint(0, 256, (128, 128), dtype=np.uint8)
-        result = utils.histogram(arr)
+        result = utils.compute_pixel_histogram(arr)
         assert sum(result["counts"]) == arr.size
 
     def test_bins_are_0_to_255(self, converter_mod):
         _, utils = converter_mod
-        if not hasattr(utils, "histogram"):
-            pytest.skip("histogram not in utils")
         arr = np.zeros((64, 64), dtype=np.uint8)
-        result = utils.histogram(arr)
+        result = utils.compute_pixel_histogram(arr)
         assert result["bins"] == list(range(256))
+
+# ---------------------------------------------------------------------------
+# Malimg-consistent layout (train/inference consistency)
+# ---------------------------------------------------------------------------
+
+class TestMalimgLayout:
+    @pytest.mark.parametrize('kb,width', [
+        (5, 32), (20, 64), (45, 128), (80, 256), (150, 384),
+        (300, 512), (800, 768), (2000, 1024),
+    ])
+    def test_width_table(self, kb, width):
+        from modules.binary_to_image.converter import BinaryConverter
+        assert BinaryConverter.malimg_width(kb * 1024) == width
+
+    def test_default_layout_is_malimg(self):
+        from modules.binary_to_image.converter import BinaryConverter
+        assert BinaryConverter().layout == 'malimg'
+
+    def test_malimg_layout_matches_reference_pipeline(self):
+        """Uploaded bytes → same pixels as a Malimg-style PNG loaded by the dataset loader."""
+        import cv2
+        import numpy as np
+        from modules.binary_to_image.converter import BinaryConverter
+        rng = np.random.default_rng(1)
+        data = rng.integers(0, 256, 50 * 1024, dtype=np.uint8).tobytes()   # 50 KB → width 128
+        w = 128
+        ref = np.frombuffer(data, dtype=np.uint8)[: (len(data) // w) * w].reshape(-1, w)
+        ref = cv2.resize(ref, (128, 128), interpolation=cv2.INTER_LINEAR)
+        out = BinaryConverter(128, layout='malimg').convert(data)
+        assert np.array_equal(out, ref)
+
+    def test_square_layout_still_available(self):
+        from modules.binary_to_image.converter import BinaryConverter
+        import numpy as np
+        out = BinaryConverter(128, layout='square').convert(bytes(range(256)) * 64)
+        assert out.shape == (128, 128) and out.dtype == np.uint8
+
+    def test_tiny_file_does_not_crash(self):
+        from modules.binary_to_image.converter import BinaryConverter
+        out = BinaryConverter(128).convert(b'MZ' + b'\x00' * 62)   # 64 bytes, minimum
+        assert out.shape == (128, 128)
+
+    def test_invalid_layout(self):
+        from modules.binary_to_image.converter import BinaryConverter
+        with pytest.raises(ValueError):
+            BinaryConverter(128, layout='diagonal')

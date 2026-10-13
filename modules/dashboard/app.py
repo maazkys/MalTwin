@@ -141,33 +141,32 @@ def render_sidebar() -> str:
 
     # Determine availability
     model_ready   = state.is_model_loaded()
-    file_ready    = state.has_uploaded_file()
     try:
         dataset_ready = config.DATA_DIR.exists() and any(config.DATA_DIR.iterdir())
     except Exception:
         dataset_ready = False
 
-    nav_options = [
-        ("Dashboard",        "Dashboard"),
-        ("Binary Upload",    "Binary Upload"),
-        ("Malware Detection" + (" (no file)" if not (model_ready and file_ready) else ""),
-         "Malware Detection"),
-        ("Dataset Gallery"   + (" (no dataset)" if not dataset_ready else ""),
-         "Dataset Gallery"),
-        ("Model Training",   "Model Training"),
-        ("Digital Twin",     "Digital Twin"),
+    # Navigation labels are FIXED. Earlier versions appended "(no file)" /
+    # "(no dataset)" to labels; Streamlit treats changed option labels as a new
+    # widget, so the user's click was lost and the page jumped back after an
+    # upload. Availability is shown in the System panel below and each page
+    # guards itself with an explanatory message instead.
+    nav_pages = [
+        "Dashboard",
+        "Binary Upload",
+        "Malware Detection",
+        "Dataset Gallery",
+        "Dynamic Analysis",
+        "Hybrid Verdict",
+        "Model Training",
+        "Digital Twin",
     ]
-
-    display_labels = [opt[0] for opt in nav_options]
-    internal_keys  = [opt[1] for opt in nav_options]
-
-    selected_display = st.sidebar.radio(
+    page = st.sidebar.radio(
         "nav",
-        options=display_labels,
+        options=nav_pages,
+        key="nav_page",
         label_visibility="hidden",
     )
-    selected_index = display_labels.index(selected_display)
-    page = internal_keys[selected_index]
 
     st.sidebar.divider()
 
@@ -182,6 +181,13 @@ def render_sidebar() -> str:
     model_status = status_badge('active', f'Model loaded ({st.session_state.get(state.KEY_DEVICE_INFO, "cpu")})') \
         if model_ready else status_badge('inactive', 'No model — run training')
     st.sidebar.markdown(model_status, unsafe_allow_html=True)
+    st.sidebar.markdown(
+        status_badge('active', 'Malimg dataset found') if dataset_ready
+        else status_badge('inactive', 'No Malimg dataset (gallery/training)'),
+        unsafe_allow_html=True,
+    )
+    if not state.has_uploaded_file():
+        st.sidebar.markdown(status_badge('inactive', 'No binary uploaded'), unsafe_allow_html=True)
 
     if state.has_uploaded_file():
         meta = st.session_state[state.KEY_FILE_META]
@@ -254,6 +260,12 @@ def main() -> None:
         render()
     elif page == "Dataset Gallery":
         from modules.dashboard.pages.gallery import render
+        render()
+    elif page == "Dynamic Analysis":
+        from modules.dashboard.pages.dynamic import render
+        render()
+    elif page == "Hybrid Verdict":
+        from modules.dashboard.pages.hybrid import render
         render()
     elif page == "Model Training":
         from modules.dashboard.pages.training import render

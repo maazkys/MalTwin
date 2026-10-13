@@ -176,7 +176,8 @@ def main():
         # classification_report is a string — exclude (too verbose for dashboard)
         serialisable = {
             k: v for k, v in metrics.items()
-            if k not in ('confusion_matrix', 'per_class', 'classification_report')
+            if k not in ('confusion_matrix', 'per_class', 'classification_report',
+                         'y_true', 'y_prob')
         }
         # per_class contains nested dicts with Python floats/ints — safe to serialise
         serialisable['per_class'] = {
@@ -196,6 +197,20 @@ def main():
         print(f"  Confusion matrix → {cm_path}")
     except Exception as e:
         print(f"  WARNING: Could not save confusion matrix: {e}", file=sys.stderr)
+
+    # ── 9. ROC curves, training curves, history ───────────────────────────────
+    try:
+        from modules.detection.evaluator import plot_roc_curves, plot_training_curves
+        if len(metrics['y_true']):
+            plot_roc_curves(metrics['y_true'], metrics['y_prob'], class_names,
+                            config.ROC_CURVE_PATH)
+            print(f"  ROC curves → {config.ROC_CURVE_PATH}")
+        plot_training_curves(history, config.TRAINING_CURVES_PATH)
+        with open(config.TRAINING_HISTORY_PATH, 'w') as f:
+            json.dump({k: v for k, v in history.items()}, f, indent=2, default=float)
+        print(f"  Training curves → {config.TRAINING_CURVES_PATH}")
+    except Exception as e:
+        print(f"  WARNING: Could not save ROC/training curves: {e}", file=sys.stderr)
 
     print("\n" + "=" * 55)
     print("Done!")

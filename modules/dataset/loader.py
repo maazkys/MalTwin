@@ -57,6 +57,7 @@ class MalimgDataset(Dataset):
         val_ratio: float = config.VAL_RATIO,
         test_ratio: float = config.TEST_RATIO,
         random_seed: int = config.RANDOM_SEED,
+        include_families: Optional[list[str]] = None,
     ):
         """
         Custom PyTorch Dataset for the Malimg malware image dataset.
@@ -68,6 +69,10 @@ class MalimgDataset(Dataset):
           - Integration with WeightedRandomSampler for class balancing
 
         The interface is otherwise Dataset-compatible (len, getitem, get_labels).
+
+        include_families: optional whitelist of family folder names. Used by the
+        unseen-family (leave-families-out) experiment to train on a subset of
+        families and keep the rest completely unseen. None = all families.
         """
         if not data_dir.exists():
             raise FileNotFoundError(f"Dataset directory not found: {data_dir}")
@@ -83,6 +88,12 @@ class MalimgDataset(Dataset):
 
         # Build label map from all family subdirectories
         family_dirs = sorted([p for p in data_dir.iterdir() if p.is_dir()], key=lambda p: p.name)
+        if include_families is not None:
+            wanted = set(include_families)
+            missing = wanted - {d.name for d in family_dirs}
+            if missing:
+                raise ValueError(f"Unknown families in include_families: {sorted(missing)}")
+            family_dirs = [d for d in family_dirs if d.name in wanted]
         all_families = [d.name for d in family_dirs]
         self.label_map = encode_labels(all_families)
         self.class_names = sorted(all_families)  # sorted alphabetically

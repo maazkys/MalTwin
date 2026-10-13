@@ -4,7 +4,7 @@ No ML dependencies. No network calls.
 """
 import hashlib
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -123,7 +123,7 @@ def get_file_metadata(
         else                    → f"{size_bytes:.2f} B"
 
     upload_time:
-        datetime.utcnow().isoformat()
+        datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
     """
     size_bytes = len(file_bytes)
     if size_bytes >= 1_048_576:
@@ -139,5 +139,5 @@ def get_file_metadata(
         'size_human': size_human,
         'format': file_format,
         'sha256': compute_sha256(file_bytes),
-        'upload_time': datetime.utcnow().isoformat(),
+        'upload_time': datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
     }

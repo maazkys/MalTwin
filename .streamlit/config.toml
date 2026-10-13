@@ -1,0 +1,16 @@
+# MalTwin Streamlit configuration (read when running from the repo root)
+
+[client]
+# The app has its own sidebar navigation (app.py). Hide Streamlit's automatic
+# multipage list, which would otherwise expose modules/dashboard/pages/*.py
+# as separate, blank pages.
+showSidebarNavigation = false
+
+[server]
+# SRS FR3.1: uploads are capped at 50 MB
+maxUploadSize = 50
+# SRS SEC-5: bind to localhost by default
+address = "127.0.0.1"
+
+[browser]
+gatherUsageStats = false

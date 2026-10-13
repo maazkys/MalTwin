@@ -16,7 +16,7 @@ get_all_module_statuses() is cached with ttl=30 seconds.
 Individual check functions never raise.
 """
 import streamlit as st
-from datetime import datetime
+from datetime import datetime, timezone
 
 import config
 
@@ -220,16 +220,57 @@ def _check_module8_reporting() -> dict:
         return {'status': 'error', 'detail': f'M8 error: {e}', 'emoji': '🔴'}
 
 
+def _check_module9_dynamic() -> dict:
+    """M9: Dynamic behavioural analysis — model trained on IoT-23 (or demo)."""
+    try:
+        import modules.dynamic  # noqa: F401
+        if not config.DYNAMIC_MODEL_PATH.exists():
+            return {'status': 'inactive',
+                    'detail': 'No dynamic model — run scripts/train_dynamic.py',
+                    'emoji': '⚠️'}
+        source = 'unknown'
+        try:
+            import json
+            with open(config.DYNAMIC_METRICS_PATH) as f:
+                source = json.load(f).get('metadata', {}).get('data_source', 'unknown')
+        except Exception:
+            pass
+        if source == 'synthetic':
+            return {'status': 'inactive',
+                    'detail': 'Demo model trained on SYNTHETIC flows — retrain on IoT-23',
+                    'emoji': '⚠️'}
+        return {'status': 'active', 'detail': f'Dynamic model ready ({source})', 'emoji': '✅'}
+    except Exception as e:
+        return {'status': 'error', 'detail': f'M9 error: {e}', 'emoji': '🔴'}
+
+
+def _check_module10_fusion() -> dict:
+    """M10: Hybrid fusion — logic always available; full use needs M5 and M9 models."""
+    try:
+        from modules.fusion import fuse
+        fuse(static_conf=0.5, dynamic_score=0.5)
+        have_static = config.BEST_MODEL_PATH.exists()
+        have_dynamic = config.DYNAMIC_MODEL_PATH.exists()
+        if have_static and have_dynamic:
+            return {'status': 'active', 'detail': 'Fusion ready (static + dynamic models present)',
+                    'emoji': '✅'}
+        missing = [n for n, ok in (('static CNN', have_static), ('dynamic model', have_dynamic)) if not ok]
+        return {'status': 'inactive', 'detail': f"Fusion logic ready — missing {', '.join(missing)}",
+                'emoji': '⚠️'}
+    except Exception as e:
+        return {'status': 'error', 'detail': f'M10 error: {e}', 'emoji': '🔴'}
+
+
 # ── Aggregate ─────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=30, show_spinner=False)
 def get_all_module_statuses() -> list[dict]:
     """
-    Run all 8 module health checks and return a list of status dicts.
+    Run all module health checks and return a list of status dicts.
     Cached for 30 seconds — avoids hammering the filesystem on every rerun.
 
     Returns:
-        list of 8 dicts, each with keys:
+        list of dicts (one per module), each with keys:
             'id':     str  e.g. 'M1'
             'name':   str  e.g. 'Digital Twin Simulation'
             'status': str  'active' | 'inactive' | 'error'
@@ -245,6 +286,8 @@ def get_all_module_statuses() -> list[dict]:
         ('M6', 'Dashboard & Visualization',    _check_module6_dashboard),
         ('M7', 'Explainable AI (Grad-CAM)',    _check_module7_gradcam),
         ('M8', 'Automated Threat Reporting',   _check_module8_reporting),
+        ('M9', 'Dynamic Behavioural Analysis', _check_module9_dynamic),
+        ('M10', 'Hybrid Static-Dynamic Fusion', _check_module10_fusion),
     ]
 
     results = []
@@ -320,7 +363,7 @@ def _format_uptime() -> str:
         start = st.session_state.get(KEY_APP_START_TIME)
         if start is None:
             return 'unknown'
-        delta = datetime.utcnow() - start
+        delta = datetime.now(timezone.utc).replace(tzinfo=None) - start
         total_seconds = int(delta.total_seconds())
         hours, rem    = divmod(total_seconds, 3600)
         minutes, secs = divmod(rem, 60)

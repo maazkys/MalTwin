@@ -7,7 +7,7 @@ SRS refs: FR1.1, FR1.2, FR1.4
 import streamlit as st
 import plotly.graph_objects as go
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
 import config
@@ -85,7 +85,7 @@ def _render_activity_chart(db_path):
     events = get_events_by_date_range(db_path, days_back=7)
 
     # Build date → count mapping for last 7 days
-    today = datetime.utcnow().date()
+    today = datetime.now(timezone.utc).replace(tzinfo=None).date()
     date_counts: dict = defaultdict(int)
     for i in range(7):
         day = today - timedelta(days=6 - i)

@@ -1,0 +1,49 @@
+{
+  "PortScan": {
+    "description": "Horizontal scanning of the network for reachable devices and open service ports.",
+    "tactics": ["Discovery"],
+    "techniques": [
+      {"id": "T0846", "name": "Remote System Discovery"},
+      {"id": "T0840", "name": "Network Connection Enumeration"}
+    ]
+  },
+  "C&C": {
+    "description": "Periodic beaconing to a command-and-control server over a common application protocol.",
+    "tactics": ["Command and Control"],
+    "techniques": [
+      {"id": "T0869", "name": "Standard Application Layer Protocol"},
+      {"id": "T0885", "name": "Commonly Used Port"}
+    ]
+  },
+  "DDoS": {
+    "description": "High-volume flooding of a target, degrading or stopping its service.",
+    "tactics": ["Inhibit Response Function", "Impact"],
+    "techniques": [
+      {"id": "T0814", "name": "Denial of Service"},
+      {"id": "T0826", "name": "Loss of Availability"}
+    ]
+  },
+  "Attack": {
+    "description": "Active intrusion attempts against remote services (e.g. Telnet/SSH login attempts or exploits).",
+    "tactics": ["Initial Access", "Lateral Movement"],
+    "techniques": [
+      {"id": "T0866", "name": "Exploitation of Remote Services"},
+      {"id": "T0812", "name": "Default Credentials"}
+    ]
+  },
+  "FileDownload": {
+    "description": "Retrieval of additional payloads or tools from a remote server.",
+    "tactics": ["Lateral Movement", "Command and Control"],
+    "techniques": [
+      {"id": "T0867", "name": "Lateral Tool Transfer"}
+    ]
+  },
+  "Okiru": {
+    "description": "Okiru (Mirai-variant) botnet propagation: scanning and Telnet brute force against IoT devices.",
+    "tactics": ["Discovery", "Lateral Movement"],
+    "techniques": [
+      {"id": "T0846", "name": "Remote System Discovery"},
+      {"id": "T0812", "name": "Default Credentials"}
+    ]
+  }
+}

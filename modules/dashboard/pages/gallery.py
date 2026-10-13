@@ -17,6 +17,7 @@ from PIL import Image
 import numpy as np
 
 import config
+from modules.dashboard.theme import image_full_width
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -197,10 +198,9 @@ def _render_overview_strip(family_names: list[str], data_dir: str) -> None:
             images = _load_sample_images(data_dir, family, max_images=1)
             with col:
                 if images:
-                    st.image(
+                    image_full_width(
                         images[0],
                         caption=family,
-                        use_column_width=True,
                         clamp=True,
                     )
                 else:
@@ -222,9 +222,8 @@ def _render_image_grid(
         cols = st.columns(n_cols)
         for idx, (col, img_array) in enumerate(zip(cols, row_images)):
             with col:
-                st.image(
+                image_full_width(
                     img_array,
                     caption=f"{family_name} #{row_start + idx + 1}",
-                    use_column_width=True,
                     clamp=True,
                 )

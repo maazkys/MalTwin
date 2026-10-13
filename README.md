@@ -1,6 +1,6 @@
 # MalTwin — IIoT Malware Detection Framework
 
-> AI-powered malware classification for Industrial IoT environments using binary visualisation and a custom CNN.  
+> Hybrid static + dynamic malware detection for Industrial IoT: binary visualisation with a custom CNN, behavioural analysis of network traffic, and explainable fusion of the two.  
 > BS Cyber Security Capstone Project — COMSATS University Islamabad, 2023–2027
 
 ---
@@ -8,6 +8,8 @@
 ## What is MalTwin?
 
 MalTwin detects and classifies malware targeting Industrial IoT (IIoT) systems. It takes a PE or ELF binary file, converts its raw bytes into a grayscale image that captures the binary's structural patterns, then passes that image through a trained Convolutional Neural Network to classify it into one of **25 known malware families** from the Malimg dataset.
+
+Alongside this **static** view, a **dynamic** module classifies the network behaviour a sample produces (Zeek `conn.log`, trained on IoT-23), and a **fusion** module combines both into one verdict — flagging the important case where a binary matches no known family but behaves maliciously (a likely new variant).
 
 Results are displayed through a Streamlit web dashboard with confidence scores, per-class probability charts, and MITRE ATT&CK for ICS technique mappings. Every detection is logged to a local SQLite database.
 
@@ -43,7 +45,11 @@ Binary (.exe / .dll / ELF)
 - **Training manager** — run model training from the dashboard with live logs and progress
 - **System health checks** — module status + CPU/RAM metrics in the dashboard
 - **Custom dashboard theme** — dark industrial Streamlit theme with CSS overrides and chart styling
-- **Streamlit dashboard** — six-page web UI (overview, upload, detection, gallery, training, digital twin stub)
+- **Dynamic behavioural analysis (M9)** — Zeek conn.log parser (IoT-23 compatible), IIoT-aware flow features, random-forest behaviour classifier (PortScan, C&C, DDoS, Okiru, …) with per-capture explanations and MITRE ICS mapping
+- **Hybrid fusion (M10)** — decision-level fusion of CNN and behavioural scores with agreement categories (CONFIRMED / STATIC_ONLY / NOVEL_VARIANT / NO_EVIDENCE) and a what-if simulator
+- **Extended evaluation** — ROC-AUC, per-class false positive rate, MCC, top-3 accuracy, ROC/training curves, and a leave-families-out *unseen variant* experiment
+- **Performance benchmark** — measures the SRS PER-x requirements on the current machine
+- **Streamlit dashboard** — eight-page web UI (overview, upload, detection, gallery, dynamic analysis, hybrid verdict, training, digital twin design)
 - **CLI & utilities** — training, evaluation, binary conversion, synthetic data generation, MITRE verification
 
 ---
@@ -82,7 +88,17 @@ MalTwin/
 │   │   ├── trainer.py               # train(), validate_epoch()
 │   │   ├── evaluator.py             # evaluate(), plot_confusion_matrix()
 │   │   ├── inference.py             # load_model(), predict_single(), predict_batch()
-│   │   └── gradcam.py               # Grad-CAM heatmap generator
+│   │   ├── gradcam.py               # Grad-CAM heatmap generator
+│   │   └── openset.py               # Unseen-family (open-set) metrics
+│   │
+│   ├── dynamic/                     # M9 — behavioural analysis
+│   │   ├── zeek_parser.py           # Zeek / IoT-23 conn.log parser
+│   │   ├── features.py              # IP-free, IIoT-aware flow features
+│   │   ├── detector.py              # Random-forest detector + explanations
+│   │   └── synthetic.py             # Synthetic flow generator (tests/demo)
+│   │
+│   ├── fusion/                      # M10 — hybrid static+dynamic fusion
+│   │   └── fusion.py
 │   │
 │   ├── reporting/
 │   │   ├── json_report.py           # JSON forensic report builder
@@ -101,7 +117,9 @@ MalTwin/
 │   │       ├── detection.py         # Run inference, probability chart, MITRE mapping
 │   │       ├── gallery.py           # Dataset gallery and MITRE context
 │   │       ├── training.py          # Model training UI
-│   │       └── digital_twin.py      # Stub (Module 1 deferred)
+│   │       ├── dynamic.py           # Dynamic Analysis page
+│   │       ├── hybrid.py            # Hybrid Verdict page
+│   │       └── digital_twin.py      # Digital Twin design + prerequisites
 │   │
 │   └── training_manager.py          # Subprocess-based training runner
 │
@@ -110,14 +128,20 @@ MalTwin/
 │   ├── train.py                     # Full training pipeline (validate → train → evaluate)
 │   ├── evaluate.py                  # Test-set evaluation only (no retraining)
 │   ├── convert_binary.py            # Convert a single binary to PNG via CLI
-│   └── generate_data.py             # Synthetic binary generator
+│   ├── generate_data.py             # Synthetic binary generator
+│   ├── train_dynamic.py             # Train the M9 behavioural model
+│   ├── generate_flows.py            # Synthetic Zeek conn.log for demos
+│   ├── evaluate_unseen.py           # Leave-families-out variant experiment
+│   └── benchmark.py                 # SRS performance measurements
 │
 ├── data/
 │   ├── malimg/                      # ← Download dataset here (not in git)
 │   ├── processed/                   # class_names.json, eval_metrics.json, confusion_matrix.png (generated)
 │   ├── logs/                        # Sample SQLite DB snapshot (optional)
 │   │   └── maltwin.db
-│   └── mitre_ics_mapping.json       # Static MITRE ATT&CK ICS reference data
+│   ├── iot23/                       # ← IoT-23 conn.log files (not in git)
+│   ├── mitre_ics_mapping.json       # MITRE ATT&CK ICS per malware family
+│   └── mitre_ics_behaviour_mapping.json  # MITRE ATT&CK ICS per behaviour
 │
 ├── models/
 │   ├── best_model.pt                # Best checkpoint by val accuracy (generated)
@@ -140,6 +164,9 @@ MalTwin/
     ├── test_reporting.py
     ├── test_training_manager.py
     ├── test_integration.py
+    ├── test_evaluation_extended.py
+    ├── test_dynamic.py
+    ├── test_fusion.py
     └── fixtures/
         ├── sample_pe.exe            # Minimal valid PE (1024 bytes, MZ header)
         └── sample_elf               # Minimal valid ELF (1024 bytes, \x7fELF header)
@@ -260,6 +287,23 @@ Use `--save-metrics` to overwrite `eval_metrics.json`:
 python scripts/evaluate.py --save-metrics
 ```
 
+### Dynamic analysis model (IoT-23)
+
+Download the IoT-23 *lighter* archive (labelled `conn.log.labeled` files) from the Stratosphere Lab and extract it under `data/iot23/`. Any subset of scenarios works.
+
+```bash
+python scripts/train_dynamic.py                 # random stratified split
+python scripts/train_dynamic.py --split capture # hold out whole captures (harder)
+python scripts/train_dynamic.py --synthetic 6000  # no IoT-23: demo model, clearly labelled as synthetic
+```
+
+### Extra evaluation
+
+```bash
+python scripts/evaluate_unseen.py --holdout 5   # unseen-family (variant) experiment
+python scripts/benchmark.py                     # SRS performance requirements
+```
+
 ### Convert a binary to a PNG image
 
 ```bash
@@ -319,7 +363,7 @@ Flatten → Linear(2048→512) → ReLU → Dropout(0.5) → Linear(512→25)
 Output: (batch, 25)   ← raw logits, softmax applied at inference only
 ```
 
-**~3.2M parameters.** Trained with Adam + ReduceLROnPlateau, CrossEntropyLoss, weighted random oversampling to handle the 36:1 class imbalance in Malimg (Allaple.A has 2,949 samples; Skintrim.N has 80).
+**1,348,793 parameters (≈1.35 M).** Trained with Adam + ReduceLROnPlateau, CrossEntropyLoss, weighted random oversampling to handle the 36:1 class imbalance in Malimg (Allaple.A has 2,949 samples; Skintrim.N has 80).
 
 ---
 
@@ -363,8 +407,10 @@ Integration tests are marked `@pytest.mark.integration` and require the Malimg d
 | 📂 Binary Upload | Upload `.exe`, `.dll`, or `.elf`, validates magic bytes, 50 MB limit, shows metadata table + pixel histogram |
 | 🔍 Malware Detection | Run CNN inference on the uploaded binary, shows predicted family with confidence bar (green/amber/red), top-3 predictions, full 25-class probability chart, MITRE ATT&CK for ICS mapping, PDF/JSON report export |
 | 🖼️ Dataset Gallery | Per-family gallery with MITRE context expander |
+| 📡 Dynamic Analysis | Upload a Zeek `conn.log` (or generate a labelled synthetic demo capture); capture verdict, behaviour profile, explanation, MITRE ICS techniques, most suspicious flows, JSON export |
+| ⚖️ Hybrid Verdict | Fuse the latest static detection with the latest dynamic report; agreement category, combined MITRE table, JSON export; what-if simulator |
 | 🏋️ Model Training | Configure and run training from the dashboard with live logs and progress |
-| 🖥️ Digital Twin | Stub page — Module 1 (Docker/Mininet IIoT simulation) is deferred to a future sprint |
+| 🖥️ Digital Twin | Architecture, planned nodes, interface contract and live prerequisite checks — implementation scheduled for the final evaluation |
 
 **ELF upload note:** Linux/IIoT ELF binaries often have no extension. Rename them to `.elf` before uploading so the browser file picker will accept them. Validation still uses magic bytes, not the extension.
 
@@ -382,6 +428,12 @@ Environment variables in `.env` (copied from `.env.example`) control paths and t
 | `MALTWIN_LOG_DIR` | `./logs` | SQLite detection database directory |
 | `MALTWIN_REPORTS_DIR` | `./reports` | PDF/JSON report output directory (config.py fallback: `./data/reports`) |
 | `MALTWIN_IMG_SIZE` | `128` | Output image size (N×N) |
+| `MALTWIN_IMAGE_LAYOUT` | `malimg` | Byte layout before resize: `malimg` (Nataraj width table, matches training data) or `square` |
+| `MALTWIN_DYNAMIC_DATA_DIR` | `./data/iot23` | IoT-23 conn.log root for the dynamic model |
+| `MALTWIN_FUSION_STATIC_WEIGHT` | `0.5` | Fusion weight for the CNN |
+| `MALTWIN_FUSION_DYNAMIC_WEIGHT` | `0.5` | Fusion weight for the behavioural model |
+| `MALTWIN_FUSION_MALICIOUS` | `0.70` | Fused score for a MALICIOUS verdict |
+| `MALTWIN_FUSION_SUSPICIOUS` | `0.40` | Fused score for a SUSPICIOUS verdict |
 | `MALTWIN_BATCH_SIZE` | `32` | Training batch size |
 | `MALTWIN_EPOCHS` | `30` | Training epochs |
 | `MALTWIN_LR` | `0.001` | Adam learning rate |
@@ -417,15 +469,18 @@ Additional runtime constants (defined in `config.py`):
 | M4 — Data Enhancement & Balancing | ✅ Complete | |
 | M5 — Malware Detection CNN | ✅ Complete | Requires training run |
 | M6 — Dashboard & Visualization | ✅ Complete | |
-| M1 — Digital Twin Simulation | ⚠️ Deferred | Requires Docker + Mininet infrastructure |
+| M1 — Digital Twin Simulation | 🟡 Designed | Architecture and interface fixed; implementation for final evaluation (Docker networking; Mininet optional) |
 | M7 — Explainable AI (Grad-CAM) | ✅ Complete | Captum heatmap pipeline with overlay export |
 | M8 — Automated Threat Reporting | ✅ Complete | PDF + JSON export with MITRE mapping |
+| M9 — Dynamic Behavioural Analysis | ✅ Complete | Requires IoT-23 conn.log files for a real (non-demo) model |
+| M10 — Hybrid Static–Dynamic Fusion | ✅ Logic complete | Paired evaluation needs the Digital Twin to run samples and capture their traffic |
 
 ---
 
 ## Acknowledgements
 
 - **Malimg Dataset** — Nataraj et al., "Malware Images: Visualization and Automatic Classification" (2011)
+- **IoT-23 Dataset** — Garcia, Parmisano & Erquiaga, Stratosphere Laboratory, CTU (2020)
 - **MITRE ATT&CK for ICS** — MITRE Corporation
 
 ---

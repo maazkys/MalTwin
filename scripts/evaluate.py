@@ -150,7 +150,7 @@ def main():
             metrics_path = config.EVAL_METRICS_PATH
             serialisable = {
                 k: v for k, v in metrics.items()
-                if k not in ('confusion_matrix', 'per_class', 'classification_report')
+                if k not in ('confusion_matrix', 'per_class', 'classification_report', 'y_true', 'y_prob')
             }
             serialisable['per_class'] = {
                 family: dict(stats) for family, stats in metrics['per_class'].items()
@@ -160,6 +160,16 @@ def main():
             print(f"Eval metrics saved to {metrics_path}")
         except Exception as e:
             print(f"WARNING: Could not save eval metrics: {e}", file=sys.stderr)
+        try:
+            from modules.detection.evaluator import plot_confusion_matrix, plot_roc_curves
+            plot_confusion_matrix(metrics['confusion_matrix'], class_names,
+                                  config.CONFUSION_MATRIX_PATH)
+            if len(metrics['y_true']):
+                plot_roc_curves(metrics['y_true'], metrics['y_prob'], class_names,
+                                config.ROC_CURVE_PATH)
+            print(f"Plots saved to {config.PROCESSED_DIR}")
+        except Exception as e:
+            print(f"WARNING: Could not save plots: {e}", file=sys.stderr)
 
     sys.exit(0)
 

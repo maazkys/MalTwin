@@ -5,7 +5,7 @@ Structured JSON forensic report builder.
 SRS refs: M8 FE-1, FE-2, FE-3, UC-03
 """
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import config
@@ -36,7 +36,7 @@ def generate_json_report(report_data: dict) -> bytes:
             'report_metadata': {
                 'generator':       'MalTwin Forensic Reporting Module',
                 'report_version':  '1.0',
-                'generated_at':    datetime.utcnow().isoformat(),
+                'generated_at':    datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
                 'framework':       'MalTwin v1.0 — COMSATS University Islamabad',
             },
             'file_information': {

@@ -67,7 +67,8 @@ def train(
         factor=0.5,
         patience=lr_patience,
         min_lr=1e-6,
-        verbose=True,
+        # NOTE: no verbose=True — removed in newer PyTorch releases and the
+        # current LR is already printed in the per-epoch summary below.
     )
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
